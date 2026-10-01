@@ -146,3 +146,26 @@ the wifi hardware (or the hook was installed too late).
   and reads `0x0D0` (W_RXFILTER) as `0x581`, which it must have written, so writes do happen.
 - The first build logged every RAM access synchronously (~30k lines), which coincided with graphics
   glitches. Logging is now throttled and gated behind the property above.
+
+### What a game does when it tries to connect (v4 log, error 50099)
+
+Register names per GBATEK (offsets relative to `0x04808000`, i.e. the `+0x8000` mirror).
+
+1. **Self-test:** writes `0xFFFF`, `0x5A5A`, `0xA5A5` and a counting pattern to the MAC, BSSID and RX/TX
+   buffer registers and reads them back (mask check), then fills/checks wifi RAM.
+2. **Baseband/RF init:** `W_BB_CNT` (`0x158`) reads/writes polling `W_BB_BUSY` (`0x15E`); RF writes via
+   `W_RF_DATA2/1` (`0x17C`/`0x17E`) polling `W_RF_BUSY` (`0x180`); `W_RF_CNT` (`0x184`) = `0x18`.
+3. **MAC setup:** MAC `00:01:02:03:04:05` written to `0x018`–`0x01C` (from firmware); `W_IE` (`0x012`) =
+   `0xE03F`; `W_US_COUNTCNT`/`W_US_COMPARECNT` (`0x0E8`/`0x0EA`) = 1; `W_RXCNT` (`0x030`) = `0x8000`;
+   RX buffer `0x4BFC`–`0x5F60`; `W_RXFILTER` (`0x0D0`) = `0x581`; `W_RXFILTER2` (`0x0E0`) = `0xB`;
+   `W_TXREQ_SET` (`0x0AE`) = `0xD`.
+4. **Wake-up:** `W_POWERFORCE` (`0x040`) = `0x8001` then `0`, `W_POWERSTATE` (`0x03C`) = `2`, then it
+   reads `W_POWERSTATE`, which the stub always returns as `0x0200` (still asleep), and `W_RF_STATUS`
+   (`0x214`), which stays `0`.
+5. **Scan loop:** polls `W_RF_PINS` (`0x19C`, always 0 in the stub) ~110k times/s for ~2 s per
+   attempt, re-runs steps 3–4 (55 times in this log), then fails with **error 50099**.
+
+So the chip never powers up or enters RX, no `W_US_COMPARE`/RX interrupts arrive, and no beacon is
+ever received. The emulation has to provide, at minimum: the power state machine (`0x03C`/`0x040`),
+`W_RF_STATUS`/`W_RF_PINS`, `W_US_COUNT`/`W_US_COMPARE` with IRQs, and RX of beacons from a fake AP into
+the RX ring buffer in wifi RAM. Timers and IRQs while the ARM7 is halted need the scheduler hook.
