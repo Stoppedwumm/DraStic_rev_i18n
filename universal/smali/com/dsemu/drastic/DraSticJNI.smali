@@ -95,6 +95,33 @@
     sput-boolean v0, Lcom/dsemu/drastic/DraSticJNI;->JniStartupError:Z
 
     :goto_1
+    sget v1, Lcom/dsemu/drastic/DraSticJNI;->JniCpuType:I
+
+    const/4 v2, 0x3
+
+    if-ne v1, v2, :cond_5
+
+    sget-boolean v1, Lcom/dsemu/drastic/DraSticJNI;->JniStartupError:Z
+
+    if-nez v1, :cond_5
+
+    invoke-static {}, Lcom/dsemu/drastic/DraSticJNI;->loadWfc()V
+
+    :cond_5
+    return-void
+.end method
+
+.method private static loadWfc()V
+    .locals 1
+
+    :try_start_0
+    const-string v0, "drastic_wfc"
+
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    :try_end_0
+    .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0
+
+    :catch_0
     return-void
 .end method
 

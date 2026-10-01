@@ -89,3 +89,25 @@ The timer read path (`0x22ba8`) shows how to compute the current system cycle co
 - **APK side.** `INTERNET` permission, `System.loadLibrary` of the hook library right after
   `libdrastic`, and a settings toggle.
 - Only arm64 has been analysed (the target device, Anbernic RG DS, is arm64).
+
+## Step 1: wifi access logger (`wfc/`)
+
+`wfc/src/wfc_hook.c` builds `libdrastic_wfc.so` (arm64 only; `ANDROID_NDK_HOME=… ./wfc/build.sh`
+writes it to `universal/lib/arm64-v8a/`). `DraSticJNI.<clinit>` loads it right after
+`libdrastic_arm64` (only on arm64 and only when the core loaded; any failure is swallowed).
+
+On load it checks that the handler table holds exactly the expected r2.6.0.4a pointers, then swaps in
+wrappers that call the original handlers and log accesses. Emulation behaviour is unchanged.
+
+Output (tag `DraSticWFC`):
+
+- `adb logcat -s DraSticWFC`, and/or
+- `Android/data/<package>/files/wfc_log.txt` (if the directory exists and is writable).
+
+What it logs: `wifi handlers hooked` at startup, `first wifi access - hook is live` once a game
+touches the wifi region, the first 16 reads/writes per register (`R16 04800000 -> 00000000`), and
+every ~2 s a summary of registers that were accessed more often than that.
+
+To test: open a WFC game, go into its Nintendo WFC / online menu and try to connect, then grab
+the log. If `wifi handlers hooked` appears but `hook is live` never does, the game never touched
+the wifi hardware (or the hook was installed too late).
