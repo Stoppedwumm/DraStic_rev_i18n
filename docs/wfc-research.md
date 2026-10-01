@@ -135,7 +135,14 @@ the wifi hardware (or the hook was installed too late).
   `0x133bc8`/`0x133be0` as read/write pairs), and ARM7 I/O write16 (`0x25588`) handles offsets
   `>= 0x800000` inline at `0x256d8` with the same code as the wifi write16 stub. So wifi writes
   arrive via the I/O write handlers, and the `0x133be0` wifi write slots are effectively dead.
-  The logger now hooks the I/O write triplet and logs only offsets `>= 0x800000`; a wifi chip
-  emulation must intercept writes there too.
+  Hooking the I/O write table is not enough either: the recompiled ARM7 code's memory write
+  stub (`0x8316c`–`0x831a4`) calls `0x25588` **directly** for any `0x04xxxxxx` address. write32
+  (`0x25da0`) drops wifi writes (`lsr w8, w21, #23; cbnz`), and write8 does not handle them, so
+  write16 is the only wifi write path. The logger (v4) therefore inline-patches the entry of `0x25588`
+  (`ldr x16, #8; br x16; .quad hook`; the four original `stp`s are moved into a trampoline). The text
+  page is switched straight to RWX and back to RX, never dropping exec. A wifi chip emulation must
+  intercept writes the same way.
+- Seen while a game tries to connect (error 50099): it polls `0x19C` (W_RF_PINS) ~100k times/s
+  and reads `0x0D0` (W_RXFILTER) as `0x581`, which it must have written, so writes do happen.
 - The first build logged every RAM access synchronously (~30k lines), which coincided with graphics
   glitches. Logging is now throttled and gated behind the property above.

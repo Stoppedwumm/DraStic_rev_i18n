@@ -2,9 +2,9 @@
  * libdrastic_wfc.so - wifi register access logger for DraStic r2.6.0.4a (arm64).
  *
  * Step 1 of WFC support (see docs/wfc-research.md): replace the ARM7 wifi read
- * handlers and the ARM7 I/O write handlers in libdrastic_arm64.so's static
- * handler table with wrappers that call the originals and log wifi accesses.
- * No emulation behaviour changes.
+ * handlers in libdrastic_arm64.so's static handler table, and inline-patch the
+ * ARM7 I/O write16 handler, with wrappers that call the originals and log wifi
+ * accesses. No emulation behaviour changes.
  *
  * Output goes to logcat (tag "DraSticWFC") and, when writable, to
  * <external storage>/Android/data/<package>/files/wfc_log.txt.
@@ -34,18 +34,24 @@
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Bump on every change so logs show which build produced them. */
-#define WFC_VERSION 3
+#define WFC_VERSION 4
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
-#define TABLE_IO_WRITE   0x133bb0
 #define TABLE_WIFI_READ  0x133bc8
+#define IO_WRITE16       0x25588
 
 /*
- * Reads of 0x048xxxxx go through the wifi read table, but writes go through the
- * ARM7 I/O write handlers, which handle offsets >= 0x800000 inline (0x256d8).
+ * Reads of 0x048xxxxx go through the wifi read table. Writes do not: the
+ * recompiled ARM7 code calls the ARM7 I/O write16 handler directly (bl at
+ * 0x831a4), which handles offsets >= 0x800000 inline (0x256d8). write32 drops
+ * wifi writes and write8 does not handle them, so write16 is the only path.
  */
 static const uintptr_t expected_read[3] = { 0x261b8, 0x261c0, 0x26274 };
-static const uintptr_t expected_write[3] = { 0x24f3c, 0x25588, 0x25da0 };
+
+/* Prologue of IO_WRITE16: stp x24,x23,[sp,#-0x40]!; stp x22,x21,[sp,#0x10];
+ * stp x20,x19,[sp,#0x20]; stp x29,x30,[sp,#0x30]. Position-independent, so it
+ * can be moved into a trampoline as is. */
+static const uint32_t expected_prologue[4] = { 0xa9bc5ff8, 0xa90157f6, 0xa9024ff4, 0xa9037bfd };
 
 #define IS_WIFI(addr) (((addr) & 0xFFFFFF) >= 0x800000)
 
@@ -53,7 +59,7 @@ typedef uint32_t (*read_fn)(void *state, uint32_t addr);
 typedef void (*write_fn)(void *state, uint32_t addr, uint32_t value);
 
 static read_fn orig_read[3];
-static write_fn orig_write[3];
+static write_fn orig_write16;
 
 static FILE *log_file;
 
@@ -156,25 +162,11 @@ static uint32_t hook_read32(void *state, uint32_t addr)
     return v;
 }
 
-static void hook_write8(void *state, uint32_t addr, uint32_t value)
-{
-    if (IS_WIFI(addr))
-        record(1, 8, addr, value);
-    orig_write[0](state, addr, value);
-}
-
 static void hook_write16(void *state, uint32_t addr, uint32_t value)
 {
     if (IS_WIFI(addr))
         record(1, 16, addr, value);
-    orig_write[1](state, addr, value);
-}
-
-static void hook_write32(void *state, uint32_t addr, uint32_t value)
-{
-    if (IS_WIFI(addr))
-        record(1, 32, addr, value);
-    orig_write[2](state, addr, value);
+    orig_write16(state, addr, value);
 }
 
 static void open_log_file(void)
@@ -208,13 +200,63 @@ static void open_log_file(void)
         __android_log_print(ANDROID_LOG_INFO, TAG, "cannot open %s: %s", path, strerror(errno));
 }
 
+/* ldr x16, #8; br x16; .quad target */
+static void put_abs_jump(uint32_t *at, uintptr_t target)
+{
+    at[0] = 0x58000050;
+    at[1] = 0xd61f0200;
+    memcpy(&at[2], &target, sizeof(target));
+}
+
+/*
+ * Redirect the function at fn to hook. Returns a callable copy of the original
+ * (relocated prologue + jump back), or NULL on failure with fn left untouched.
+ */
+static void *inline_hook(uintptr_t fn, void *hook)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t start = fn & ~(uintptr_t)(page - 1);
+    uintptr_t end = (fn + 16 + page - 1) & ~(uintptr_t)(page - 1);
+    uint32_t *tramp;
+
+    if (memcmp((void *)fn, expected_prologue, sizeof(expected_prologue)) != 0) {
+        log_line("write16 prologue mismatch, not hooking writes");
+        return NULL;
+    }
+
+    tramp = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tramp == MAP_FAILED) {
+        log_line("trampoline mmap failed: %s", strerror(errno));
+        return NULL;
+    }
+    memcpy(tramp, expected_prologue, sizeof(expected_prologue));
+    put_abs_jump(tramp + 4, fn + 16);
+    if (mprotect(tramp, page, PROT_READ | PROT_EXEC) != 0) {
+        log_line("trampoline mprotect failed: %s", strerror(errno));
+        munmap(tramp, page);
+        return NULL;
+    }
+    __builtin___clear_cache((char *)tramp, (char *)(tramp + 8));
+
+    /* Keep PROT_EXEC throughout: the page is live code. */
+    if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        log_line("text mprotect RWX failed: %s", strerror(errno));
+        munmap(tramp, page);
+        return NULL;
+    }
+    put_abs_jump((uint32_t *)fn, (uintptr_t)hook);
+    mprotect((void *)start, end - start, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char *)fn, (char *)fn + 16);
+    return tramp;
+}
+
 static int install_hooks(void)
 {
     void *handle = dlopen(CORE_LIB, RTLD_NOW | RTLD_NOLOAD);
     void *sym;
     Dl_info info;
     uintptr_t base, start, end;
-    uintptr_t *rtab, *wtab;
+    uintptr_t *rtab;
     long page = sysconf(_SC_PAGESIZE);
     int i;
 
@@ -229,23 +271,20 @@ static int install_hooks(void)
     }
     base = (uintptr_t)info.dli_fbase;
     rtab = (uintptr_t *)(base + TABLE_WIFI_READ);
-    wtab = (uintptr_t *)(base + TABLE_IO_WRITE);
 
     /* Refuse to touch anything unless this is exactly the build we analysed. */
     for (i = 0; i < 3; i++) {
-        if (rtab[i] != base + expected_read[i] || wtab[i] != base + expected_write[i]) {
+        if (rtab[i] != base + expected_read[i]) {
             log_line("handler table mismatch (unsupported DraStic build), not hooking");
             return -1;
         }
     }
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 3; i++)
         orig_read[i] = (read_fn)rtab[i];
-        orig_write[i] = (write_fn)wtab[i];
-    }
 
     /* The table lives in RELRO, so temporarily make it writable. */
-    start = (uintptr_t)wtab & ~(uintptr_t)(page - 1);
+    start = (uintptr_t)rtab & ~(uintptr_t)(page - 1);
     end = ((uintptr_t)(rtab + 3) + page - 1) & ~(uintptr_t)(page - 1);
     if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) != 0) {
         log_line("mprotect RW failed: %s", strerror(errno));
@@ -255,12 +294,13 @@ static int install_hooks(void)
     rtab[0] = (uintptr_t)hook_read8;
     rtab[1] = (uintptr_t)hook_read16;
     rtab[2] = (uintptr_t)hook_read32;
-    wtab[0] = (uintptr_t)hook_write8;
-    wtab[1] = (uintptr_t)hook_write16;
-    wtab[2] = (uintptr_t)hook_write32;
 
     mprotect((void *)start, end - start, PROT_READ);
-    log_line("wifi handlers hooked (core base %p)", (void *)base);
+    log_line("wifi read handlers hooked (core base %p)", (void *)base);
+
+    orig_write16 = (write_fn)inline_hook(base + IO_WRITE16, (void *)hook_write16);
+    if (orig_write16)
+        log_line("I/O write16 hooked");
     return 0;
 }
 
