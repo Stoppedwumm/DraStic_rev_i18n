@@ -344,6 +344,7 @@ typedef struct {
     uint32_t rcv_nxt;        /* next byte expected from the console */
     uint32_t snd_una;        /* oldest byte the console has not acked */
     uint32_t snd_nxt;        /* next byte to send */
+    uint32_t snd_max;        /* highest byte sent so far (snd_nxt rewinds on retransmit) */
     uint32_t iss;
     uint16_t cwnd;           /* console's advertised window */
     uint16_t mss;
@@ -353,6 +354,11 @@ typedef struct {
     int fin_sent;
     int console_fin;
     uint32_t last_progress_ms;
+    /* diagnostics */
+    uint32_t open_ms;
+    uint32_t bytes_up;       /* console -> server, accepted by the socket */
+    uint32_t bytes_down;     /* server -> console, read from the socket */
+    uint32_t retransmits;
 } tcp_conn;
 
 static tcp_conn tcp_conns[MAX_TCP];
@@ -384,8 +390,12 @@ static void tcp_send(tcp_conn *c, uint32_t seq, uint8_t flags, const uint8_t *da
     send_ip(buf, hl + len, 6, c->rip, IP_CLIENT);
 }
 
-static void tcp_free(tcp_conn *c)
+static void tcp_free(tcp_conn *c, const char *why)
 {
+    if (log_level >= 1 && c->state != T_FREE)
+        log_line("net: TCP %u.%u.%u.%u:%u closed (%s): %u bytes up, %u down, %u retransmits, %u ms",
+                 c->rip >> 24, (c->rip >> 16) & 255, (c->rip >> 8) & 255, c->rip & 255, c->rport,
+                 why, c->bytes_up, c->bytes_down, c->retransmits, now_ms - c->open_ms);
     if (c->fd > 0)
         close(c->fd);
     free(c->buf);
@@ -465,6 +475,7 @@ static void tcp_open(uint32_t rip, uint16_t rport, uint16_t cport, uint32_t seq,
     c->cwnd = 2048;
     c->buf = malloc(TCP_BUF);
     c->last_progress_ms = now_ms;
+    c->open_ms = now_ms;
     if (log_level >= 1)
         log_line("net: TCP connect %u.%u.%u.%u:%u", rip >> 24, (rip >> 16) & 255,
                  (rip >> 8) & 255, rip & 255, rport);
@@ -495,7 +506,7 @@ static void handle_tcp(const uint8_t *ip, int iplen, int ihl)
 
     if (flags & TH_RST) {
         if (c)
-            tcp_free(c);
+            tcp_free(c, "reset by console");
         return;
     }
 
@@ -535,16 +546,18 @@ static void handle_tcp(const uint8_t *ip, int iplen, int ihl)
             c->snd_una = ack;
             c->last_progress_ms = now_ms;
         } else if (c->state == T_OPEN && (int32_t)(ack - c->snd_una) > 0 &&
-                   (int32_t)(ack - c->snd_nxt) <= 0) {
+                   (int32_t)(ack - c->snd_max) <= 0) {
             uint32_t acked = ack - c->snd_una;
 
-            if (c->fin_sent && ack == c->snd_nxt && (int)acked == c->buflen + 1)
-                acked--;   /* the FIN itself */
+            if ((int)acked > c->buflen)
+                acked = c->buflen;   /* the rest acknowledges our FIN */
             if ((int)acked > c->buflen)
                 acked = c->buflen;
             memmove(c->buf, c->buf + acked, c->buflen - acked);
             c->buflen -= acked;
             c->snd_una = ack;
+            if ((int32_t)(c->snd_nxt - ack) < 0)
+                c->snd_nxt = ack;
             c->last_progress_ms = now_ms;
         }
     }
@@ -557,8 +570,10 @@ static void handle_tcp(const uint8_t *ip, int iplen, int ihl)
             ssize_t n = send(c->fd, tcp + hl, len, MSG_NOSIGNAL);
 
             /* Only acknowledge what the socket took; the console resends the rest. */
-            if (n > 0)
+            if (n > 0) {
                 c->rcv_nxt += n;
+                c->bytes_up += n;
+            }
         }
         tcp_send(c, c->snd_nxt, TH_ACK, NULL, 0);
     }
@@ -570,8 +585,8 @@ static void handle_tcp(const uint8_t *ip, int iplen, int ihl)
         tcp_send(c, c->snd_nxt, TH_ACK, NULL, 0);
     }
 
-    if (c->console_fin && c->fin_sent && c->snd_una == c->snd_nxt)
-        tcp_free(c);
+    if (c->console_fin && c->fin_sent && c->snd_una == c->snd_max)
+        tcp_free(c, "closed normally");
 }
 
 static void poll_tcp_conn(tcp_conn *c)
@@ -594,12 +609,13 @@ static void poll_tcp_conn(tcp_conn *c)
             if (log_level >= 1)
                 log_line("net: TCP connect failed: %s", strerror(err));
             tcp_send(c, 0, TH_RST | TH_ACK, NULL, 0);
-            tcp_free(c);
+            tcp_free(c, "server unreachable");
             return;
         }
         c->state = T_SYNACK_SENT;
         tcp_send(c, c->iss, TH_SYN | TH_ACK, NULL, 0);
         c->snd_nxt = c->iss + 1;
+        c->snd_max = c->snd_nxt;
         c->last_progress_ms = now_ms;
         return;
     }
@@ -616,16 +632,22 @@ static void poll_tcp_conn(tcp_conn *c)
     if (!c->remote_eof && c->buflen < TCP_BUF && poll(&pfd, 1, 0) > 0) {
         ssize_t n = recv(c->fd, c->buf + c->buflen, TCP_BUF - c->buflen, 0);
 
-        if (n > 0)
+        if (n > 0) {
             c->buflen += n;
-        else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            c->bytes_down += n;
+        } else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
             c->remote_eof = 1;
+            if (log_level >= 1)
+                log_line("net: TCP server closed after %u bytes down (%s)", c->bytes_down,
+                         n == 0 ? "EOF" : strerror(errno));
+        }
     }
 
     /* Retransmit (go-back-N) when the console stops acknowledging. */
-    if (c->snd_nxt != c->snd_una && now_ms - c->last_progress_ms > TCP_RTO_MS) {
+    if (c->snd_max != c->snd_una && now_ms - c->last_progress_ms > TCP_RTO_MS) {
         c->snd_nxt = c->snd_una;
         c->fin_sent = 0;
+        c->retransmits++;
         c->last_progress_ms = now_ms;
     }
 
@@ -649,11 +671,13 @@ static void poll_tcp_conn(tcp_conn *c)
         c->snd_nxt++;
         c->fin_sent = 1;
     }
+    if ((int32_t)(c->snd_nxt - c->snd_max) > 0)
+        c->snd_max = c->snd_nxt;
 
     /* Drop connections that have been dead for a long time. */
     if (now_ms - c->last_progress_ms > 120000) {
         tcp_send(c, c->snd_nxt, TH_RST | TH_ACK, NULL, 0);
-        tcp_free(c);
+        tcp_free(c, "idle timeout");
     }
 }
 
@@ -680,7 +704,7 @@ void net_reset(void)
     memset(udp_flows, 0, sizeof(udp_flows));
     for (i = 0; i < MAX_TCP; i++) {
         if (tcp_conns[i].state != T_FREE)
-            tcp_free(&tcp_conns[i]);
+            tcp_free(&tcp_conns[i], "network reset");
     }
     have_client_mac = 0;
 }

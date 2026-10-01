@@ -45,7 +45,7 @@
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Bump on every change so logs show which build produced them. */
-#define WFC_VERSION 8
+#define WFC_VERSION 9
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
 #define TABLE_WIFI_READ  0x133bc8
