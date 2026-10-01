@@ -179,7 +179,7 @@ the RX ring buffer in wifi RAM. Timers and IRQs while the ARM7 is halted need th
 | Wifi reads | wifi read table (`0x133bc8`) → `wifi_read16()` |
 | Wifi writes | inline patch of ARM7 I/O write16 (`0x25588`) and write32 (`0x25da0`); offsets `>= 0x800000` go to `wifi_write16()`, the rest to the original handler |
 | Time | inline patch of the scanline event handler (`0x2c8f8`, VCOUNT at `sys+0x14`); every call advances the chip by one line (2130 cycles at 33.513982 MHz ≈ 63.6 µs), processed in 8 µs steps |
-| Wifi IRQ | `root = *(state+0xFBA88)`, `cpu = *(root+0x1000010)`, `io = *(cpu+0x2080)`: `io[0x214] \|= 1<<24`, and if `!(cpu[0x2110] & 6)`, `cpu[0x2108] = IE & IF & -IME` (same as the VBlank code at `0x2ca60`) |
+| Wifi IRQ | ARM7 I/O registers are inline at `state+0x23070` (IME `+0x208`, IE `+0x210`, IF `+0x214`); `cpu = *(*(state+0xFBA90)+0x1000010)`. Set IF bit 24, `cpu[0x2108] = IE & IF & -IME`, and if nonzero `cpu[0x22a8] \|= 2` (same as the ARM7 write8 IE/IME path at `0x253c4`). v5 used `state+0xFBA88`, which is the **ARM9** (the IPC FIFO IRQ code at `0x25f3c` uses it to signal the other CPU), so no wifi IRQ ever reached the ARM7. |
 
 The chip (`wifi.c`) and AP (`wifi_ap.c`) are a C port of melonDS's `Wifi.cpp` / `WifiAP.cpp`
 without local multiplayer, so `wfc/` is GPLv3 (`wfc/LICENSE`). Implemented: power state machine

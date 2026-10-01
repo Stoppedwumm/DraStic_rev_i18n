@@ -44,7 +44,7 @@
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Bump on every change so logs show which build produced them. */
-#define WFC_VERSION 5
+#define WFC_VERSION 6
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
 #define TABLE_WIFI_READ  0x133bc8
@@ -67,13 +67,17 @@ static const uint32_t io_write_prologue[4] = { 0xa9bc5ff8, 0xa90157f6, 0xa9024ff
  * stp x24,x23,[sp,#0x20]; stp x22,x21,[sp,#0x30]. */
 static const uint32_t scanline_prologue[4] = { 0xf81a0ffb, 0xa90167fa, 0xa9025ff8, 0xa90357f6 };
 
-/* ARM7 state layout, from the IRQ code in the I/O write handlers (0x25f3c)
- * and the VBlank code in the scanline handler (0x2ca60). */
-#define STATE_ROOT     0xFBA88     /* handler state -> root pointer */
-#define ROOT_ARM7      0x1000010   /* root -> ARM7 cpu */
-#define CPU_IO         0x2080      /* cpu -> I/O register block */
+/*
+ * ARM7 state layout, from the ARM7 write8 handler's own IE/IF/IME path
+ * (0x253c4): the ARM7 I/O registers are inline in the handler state, and the
+ * CPU is reached through state+0xFBA90. (state+0xFBA88 leads to the ARM9; the
+ * write32 code at 0x25f3c uses it to raise the IPC FIFO IRQ there.)
+ */
+#define STATE_IO7      0x23070     /* ARM7 I/O registers, indexed by offset */
+#define STATE_SELF     0xFBA90     /* -> system whose +ROOT_CPU is the ARM7 */
+#define ROOT_CPU       0x1000010
 #define CPU_IRQ_PEND   0x2108
-#define CPU_IRQ_FLAGS  0x2110
+#define CPU_EXIT_FLAGS 0x22a8      /* bit1: re-check IRQs */
 #define IO_IME         0x208
 #define IO_IE          0x210
 #define IO_IF          0x214
@@ -181,21 +185,20 @@ static void record(int is_write, int size, uint32_t off, uint32_t value)
 
 void arm7_wifi_irq(void)
 {
-    uint8_t *root, *cpu, *io;
+    uint8_t *cpu, *io;
     uint32_t *iflags, pending;
 
     if (!wifi_state)
         return;
-    root = *(uint8_t **)(wifi_state + STATE_ROOT);
-    cpu = *(uint8_t **)(root + ROOT_ARM7);
-    io = *(uint8_t **)(cpu + CPU_IO);
+    io = wifi_state + STATE_IO7;
+    cpu = *(uint8_t **)(*(uint8_t **)(wifi_state + STATE_SELF) + ROOT_CPU);
 
     iflags = (uint32_t *)(io + IO_IF);
     *iflags |= IRQ_WIFI;
-    if (!(cpu[CPU_IRQ_FLAGS] & 6)) {
-        pending = *(uint32_t *)(io + IO_IE) & *iflags & -*(uint32_t *)(io + IO_IME);
-        *(uint32_t *)(cpu + CPU_IRQ_PEND) = pending;
-    }
+    pending = *(uint32_t *)(io + IO_IE) & *iflags & -*(uint32_t *)(io + IO_IME);
+    *(uint32_t *)(cpu + CPU_IRQ_PEND) = pending;
+    if (pending)
+        *(uint32_t *)(cpu + CPU_EXIT_FLAGS) |= 2;
     wifi_irqs++;
 }
 
