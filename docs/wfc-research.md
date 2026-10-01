@@ -38,9 +38,10 @@ The per-region memory handlers come from a static table in `.data.rel.ro`
 (filled by `R_AARCH64_RELATIVE` relocations, so it is a plain array of pointers at runtime):
 
 ```
-0x133bb0  ARM7 I/O   read8/16/32   (0x24f3c, 0x25588, 0x25da0)
+0x133b98  ARM7 I/O   read8/16/32   (0x23250, 0x2301c, 0x23280)
+0x133bb0  ARM7 I/O   write8/16/32  (0x24f3c, 0x25588, 0x25da0)  (also handles wifi writes)
 0x133bc8  ARM7 wifi  read8/16/32   (0x261b8, 0x261c0, 0x26274)
-0x133be0  ARM7 wifi  write8/16/32  (0x24ebc, 0x24ec0, 0x24f38)
+0x133be0  ARM7 wifi  write8/16/32  (0x24ebc, 0x24ec0, 0x24f38)  (not used for writes)
 ```
 
 Handler signatures (from the code): `read(void *state, u32 addr)` → `u32`,
@@ -129,8 +130,12 @@ the wifi hardware (or the hook was installed too late).
   register mask tests, BB/RF busy polling (`0x15E`, `0x180`), baseband reads (`0x158`/`0x15C`),
   `W_RANDOM` (`0x044`, always 0 in the stub).
 - Registers are accessed through the `+0x8000` mirror (`0x04808000`…).
-- **No writes were logged**, yet written values read back correctly. So DraStic's write path does
-  not go through the slots at `0x133be0`; writes must be dispatched from another table or inlined.
-  This has to be found before a wifi chip can be emulated.
+- **No writes were logged**, yet written values read back correctly. Cause: the triplet at
+  `0x133bb0` is the ARM7 I/O **write** table (the map init stores `0x133b98`/`0x133bb0` and
+  `0x133bc8`/`0x133be0` as read/write pairs), and ARM7 I/O write16 (`0x25588`) handles offsets
+  `>= 0x800000` inline at `0x256d8` with the same code as the wifi write16 stub. So wifi writes
+  arrive via the I/O write handlers, and the `0x133be0` wifi write slots are effectively dead.
+  The logger now hooks the I/O write triplet and logs only offsets `>= 0x800000`; a wifi chip
+  emulation must intercept writes there too.
 - The first build logged every RAM access synchronously (~30k lines), which coincided with graphics
   glitches. Logging is now throttled and gated behind the property above.

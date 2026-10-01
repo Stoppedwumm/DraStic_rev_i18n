@@ -1,9 +1,10 @@
 /*
  * libdrastic_wfc.so - wifi register access logger for DraStic r2.6.0.4a (arm64).
  *
- * Step 1 of WFC support (see docs/wfc-research.md): replace the six ARM7 wifi
- * region handlers in libdrastic_arm64.so's static handler table with wrappers
- * that call the originals and log every access. No emulation behaviour changes.
+ * Step 1 of WFC support (see docs/wfc-research.md): replace the ARM7 wifi read
+ * handlers and the ARM7 I/O write handlers in libdrastic_arm64.so's static
+ * handler table with wrappers that call the originals and log wifi accesses.
+ * No emulation behaviour changes.
  *
  * Output goes to logcat (tag "DraSticWFC") and, when writable, to
  * <external storage>/Android/data/<package>/files/wfc_log.txt.
@@ -33,11 +34,17 @@
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
+#define TABLE_IO_WRITE   0x133bb0
 #define TABLE_WIFI_READ  0x133bc8
-#define TABLE_WIFI_WRITE 0x133be0
 
+/*
+ * Reads of 0x048xxxxx go through the wifi read table, but writes go through the
+ * ARM7 I/O write handlers, which handle offsets >= 0x800000 inline (0x256d8).
+ */
 static const uintptr_t expected_read[3] = { 0x261b8, 0x261c0, 0x26274 };
-static const uintptr_t expected_write[3] = { 0x24ebc, 0x24ec0, 0x24f38 };
+static const uintptr_t expected_write[3] = { 0x24f3c, 0x25588, 0x25da0 };
+
+#define IS_WIFI(addr) (((addr) & 0xFFFFFF) >= 0x800000)
 
 typedef uint32_t (*read_fn)(void *state, uint32_t addr);
 typedef void (*write_fn)(void *state, uint32_t addr, uint32_t value);
@@ -148,19 +155,22 @@ static uint32_t hook_read32(void *state, uint32_t addr)
 
 static void hook_write8(void *state, uint32_t addr, uint32_t value)
 {
-    record(1, 8, addr, value);
+    if (IS_WIFI(addr))
+        record(1, 8, addr, value);
     orig_write[0](state, addr, value);
 }
 
 static void hook_write16(void *state, uint32_t addr, uint32_t value)
 {
-    record(1, 16, addr, value);
+    if (IS_WIFI(addr))
+        record(1, 16, addr, value);
     orig_write[1](state, addr, value);
 }
 
 static void hook_write32(void *state, uint32_t addr, uint32_t value)
 {
-    record(1, 32, addr, value);
+    if (IS_WIFI(addr))
+        record(1, 32, addr, value);
     orig_write[2](state, addr, value);
 }
 
@@ -216,7 +226,7 @@ static int install_hooks(void)
     }
     base = (uintptr_t)info.dli_fbase;
     rtab = (uintptr_t *)(base + TABLE_WIFI_READ);
-    wtab = (uintptr_t *)(base + TABLE_WIFI_WRITE);
+    wtab = (uintptr_t *)(base + TABLE_IO_WRITE);
 
     /* Refuse to touch anything unless this is exactly the build we analysed. */
     for (i = 0; i < 3; i++) {
@@ -232,8 +242,8 @@ static int install_hooks(void)
     }
 
     /* The table lives in RELRO, so temporarily make it writable. */
-    start = (uintptr_t)rtab & ~(uintptr_t)(page - 1);
-    end = ((uintptr_t)(wtab + 3) + page - 1) & ~(uintptr_t)(page - 1);
+    start = (uintptr_t)wtab & ~(uintptr_t)(page - 1);
+    end = ((uintptr_t)(rtab + 3) + page - 1) & ~(uintptr_t)(page - 1);
     if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) != 0) {
         log_line("mprotect RW failed: %s", strerror(errno));
         return -1;
