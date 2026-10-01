@@ -18,6 +18,8 @@ extern int log_level;
 void log_line(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* Raise ARM7 IF bit 24 (wifi). */
 void arm7_wifi_irq(void);
+/* DraStic's built-in firmware MAC, 00:01:02:03:04:05. */
+extern const uint8_t dummy_mac[6];
 
 /* wifi.c - the emulated wifi chip. Offsets are relative to 0x04800000. */
 void wifi_reset(void);

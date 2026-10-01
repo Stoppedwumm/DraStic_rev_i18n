@@ -222,3 +222,19 @@ small user-mode NAT; replies are queued and delivered as FromDS data frames.
 
 Host test (fake console against `net.c`): DHCP offer for `10.0.2.15`, TCP handshake, echo data in
 both directions and FIN all work, and every generated IP/UDP/TCP checksum verifies.
+
+### v7 result and the console MAC (v8)
+
+v7 on the RG DS: DHCP, DNS via Wiimmfi and the HTTP connection test work; the HTTPS login
+(`78.46.231.155:443`) is refused with **error 20100** ("no connection with this Nintendo WFC ID").
+
+DraStic loads `system/nds_firmware_modified.bin`, then `system/nds_firmware.bin`, and otherwise
+generates a firmware image into `state+0x2b070` (`0x2b768`–`0x2b7c4`, generator at `0x2a9fc`).
+The generator copies the MAC + channel mask from `0x10d6f0`, i.e. **00:01:02:03:04:05**, the same
+for every DraStic install, which is the likely reason Wiimmfi refuses the login.
+
+v8 patches those 6 bytes before the game starts: `debug.drastic.wfc.mac` if set, else a MAC kept in
+`/data/data/<package>/files/wfc_mac.txt`, else a new random `00:09:BF:xx:xx:xx` (Nintendo OUI)
+that is then saved there, so the WFC ID Wiimmfi registers stays valid across restarts. A firmware
+already saved as `nds_firmware_modified.bin` keeps the old MAC; the chip logs a warning when the
+game still writes 00:01:02:03:04:05 to W_MACADDR.

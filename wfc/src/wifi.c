@@ -1184,6 +1184,14 @@ void wifi_write16(uint32_t off, uint16_t val)
         val &= 0x0FFF;
         break;
 
+    case W_MACADDR0 + 4:
+        REG(off) = val;
+        if (memcmp(wifi_mac(), dummy_mac, 6) == 0)
+            log_line("WARNING: the firmware still has DraStic's dummy MAC 00:01:02:03:04:05, "
+                     "which Wiimmfi refuses. Delete DraStic/system/nds_firmware_modified.bin "
+                     "(then set up the WFC connection again).");
+        return;
+
     case W_TXBUF_LOC1:
     case W_TXBUF_LOC1 + 4:
     case W_TXBUF_LOC1 + 8:

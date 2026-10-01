@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
@@ -44,13 +45,16 @@
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Bump on every change so logs show which build produced them. */
-#define WFC_VERSION 7
+#define WFC_VERSION 8
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
 #define TABLE_WIFI_READ  0x133bc8
 #define IO_WRITE16       0x25588
 #define IO_WRITE32       0x25da0
 #define SCANLINE_EVENT   0x2c8f8
+/* Default firmware MAC + channel mask, copied to firmware+0x36 by the firmware
+ * generator at 0x2a9fc when no nds_firmware(_modified).bin exists. */
+#define DEFAULT_FW_MAC   0x10d6f0
 
 /*
  * Reads of 0x048xxxxx go through the wifi read table. Writes do not: the
@@ -58,6 +62,8 @@
  * 0x831a4), which handle offsets >= 0x800000 inline (write16 at 0x256d8;
  * write32 drops them).
  */
+const uint8_t dummy_mac[6] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05 };
+
 static const uintptr_t expected_read[3] = { 0x261b8, 0x261c0, 0x26274 };
 
 /* Prologue of IO_WRITE16 and IO_WRITE32: stp x24,x23,[sp,#-0x40]!;
@@ -350,6 +356,103 @@ static void *inline_hook(uintptr_t fn, void *hook, const uint32_t prologue[4], c
     return tramp;
 }
 
+/*
+ * Every DraStic install without a firmware dump has MAC 00:01:02:03:04:05,
+ * which Wiimmfi refuses (error 20100). Give the generated firmware a stable
+ * per-device MAC instead: debug.drastic.wfc.mac if set, else one stored in
+ * the app's private files dir, else a new random one with Nintendo's OUI.
+ */
+static int parse_mac(const char *str, uint8_t mac[6])
+{
+    unsigned v[6];
+    int i;
+
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
+        return 0;
+    for (i = 0; i < 6; i++) {
+        if (v[i] > 255)
+            return 0;
+        mac[i] = v[i];
+    }
+    return !(mac[0] & 1);
+}
+
+static void get_console_mac(uint8_t mac[6])
+{
+    char prop[PROP_VALUE_MAX] = { 0 };
+    char pkg[128] = { 0 }, path[256], line[64] = { 0 };
+    FILE *f;
+
+    __system_property_get("debug.drastic.wfc.mac", prop);
+    if (parse_mac(prop, mac))
+        return;
+
+    f = fopen("/proc/self/cmdline", "r");
+    if (f) {
+        size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
+        pkg[n] = '\0';
+        fclose(f);
+    }
+    snprintf(path, sizeof(path), "/data/data/%s/files/wfc_mac.txt", pkg);
+
+    f = fopen(path, "r");
+    if (f) {
+        int ok = fgets(line, sizeof(line), f) && parse_mac(line, mac);
+        fclose(f);
+        if (ok)
+            return;
+    }
+
+    mac[0] = 0x00;
+    mac[1] = 0x09;
+    mac[2] = 0xBF;
+    f = fopen("/dev/urandom", "r");
+    if (!f || fread(mac + 3, 1, 3, f) != 3) {
+        uint64_t t = now_ns();
+        mac[3] = t >> 8;
+        mac[4] = t >> 16;
+        mac[5] = t >> 24;
+    }
+    if (f)
+        fclose(f);
+
+    snprintf(path, sizeof(path), "/data/data/%s/files", pkg);
+    mkdir(path, 0700);
+    snprintf(path, sizeof(path), "/data/data/%s/files/wfc_mac.txt", pkg);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        fclose(f);
+    } else {
+        log_line("cannot save %s: %s (MAC will change next start)", path, strerror(errno));
+    }
+}
+
+static void patch_default_mac(uintptr_t base)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    uint8_t *p = (uint8_t *)(base + DEFAULT_FW_MAC);
+    uintptr_t start = (uintptr_t)p & ~(uintptr_t)(page - 1);
+    uintptr_t end = ((uintptr_t)p + 6 + page - 1) & ~(uintptr_t)(page - 1);
+    uint8_t mac[6];
+
+    if (memcmp(p, dummy_mac, 6) != 0) {
+        log_line("default firmware MAC not found, not patching");
+        return;
+    }
+    get_console_mac(mac);
+
+    /* Same segment as the code: keep PROT_EXEC. */
+    if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        log_line("MAC patch mprotect failed: %s", strerror(errno));
+        return;
+    }
+    memcpy(p, mac, 6);
+    mprotect((void *)start, end - start, PROT_READ | PROT_EXEC);
+    log_line("console MAC %02x:%02x:%02x:%02x:%02x:%02x (for DraStic's built-in firmware)",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
 static int install_hooks(void)
 {
     void *handle = dlopen(CORE_LIB, RTLD_NOW | RTLD_NOLOAD);
@@ -416,6 +519,7 @@ static int install_hooks(void)
     rtab[2] = (uintptr_t)hook_read32;
     mprotect((void *)start, end - start, PROT_READ);
 
+    patch_default_mac(base);
     log_line("wifi emulation installed (core base %p)", (void *)base);
     return 0;
 }
