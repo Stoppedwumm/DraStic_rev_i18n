@@ -169,3 +169,36 @@ So the chip never powers up or enters RX, no `W_US_COMPARE`/RX interrupts arrive
 ever received. The emulation has to provide, at minimum: the power state machine (`0x03C`/`0x040`),
 `W_RF_STATUS`/`W_RF_PINS`, `W_US_COUNT`/`W_US_COMPARE` with IRQs, and RX of beacons from a fake AP into
 the RX ring buffer in wifi RAM. Timers and IRQs while the ARM7 is halted need the scheduler hook.
+
+## Step 2: wifi chip + fake access point (`wfc/`, v5)
+
+`libdrastic_wfc.so` now replaces DraStic's wifi stub entirely when `debug.drastic.wfc` is set:
+
+| Piece | How |
+|---|---|
+| Wifi reads | wifi read table (`0x133bc8`) → `wifi_read16()` |
+| Wifi writes | inline patch of ARM7 I/O write16 (`0x25588`) and write32 (`0x25da0`); offsets `>= 0x800000` go to `wifi_write16()`, the rest to the original handler |
+| Time | inline patch of the scanline event handler (`0x2c8f8`, VCOUNT at `sys+0x14`); every call advances the chip by one line (2130 cycles at 33.513982 MHz ≈ 63.6 µs), processed in 8 µs steps |
+| Wifi IRQ | `root = *(state+0xFBA88)`, `cpu = *(root+0x1000010)`, `io = *(cpu+0x2080)`: `io[0x214] \|= 1<<24`, and if `!(cpu[0x2110] & 6)`, `cpu[0x2108] = IE & IF & -IME` (same as the VBlank code at `0x2ca60`) |
+
+The chip (`wifi.c`) and AP (`wifi_ap.c`) are a C port of melonDS's `Wifi.cpp` / `WifiAP.cpp`
+without local multiplayer, so `wfc/` is GPLv3 (`wfc/LICENSE`). Implemented: power state machine
+(W_POWERSTATE/W_POWERFORCE/W_POWERDOWNCTRL, IRQ11), W_US_COUNT/W_US_COMPARE/beacon counters
+(IRQ13/14/15), TX via LOC1–3 (IRQ7/IRQ1, TX status, sequence numbers), RX into the ring buffer with
+the hardware header and address/BSSID filtering (IRQ6/IRQ0), RX/TX buffer data ports, BB registers,
+RF register storage.
+
+The AP is called `DraSticWFC` (MAC `02:00:44:57:46:43`, channel 6). It sends beacons every 128 ms,
+answers probe requests, authentication and association. **It answers on every channel**, because
+DraStic's built-in firmware has no RF channel tables (the RF writes in the log are all zero), so the
+selected channel cannot be decoded.
+
+Not done yet: the network bridge. Data frames from the console (DHCP, DNS, …) are dropped and
+counted, so a connection test will still fail after association.
+
+Checked on the host by replaying the v4 register log against `wifi.c`: the transceiver powers up
+(`W_RF_STATUS` = 1, `W_RF_PINS` = `0x84`), beacons land in the RX ring with header flags `0x0011`,
+and IRQ0/IRQ6 fire.
+
+Enable with `adb shell setprop debug.drastic.wfc 1` (`2` adds register accesses, `3` wifi RAM).
+With `0` / unset, DraStic's stock stub is used.

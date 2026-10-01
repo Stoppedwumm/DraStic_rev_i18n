@@ -1,17 +1,26 @@
 /*
- * libdrastic_wfc.so - wifi register access logger for DraStic r2.6.0.4a (arm64).
+ * libdrastic_wfc.so - Nintendo Wi-Fi Connection support for DraStic r2.6.0.4a
+ * (arm64). See docs/wfc-research.md.
  *
- * Step 1 of WFC support (see docs/wfc-research.md): replace the ARM7 wifi read
- * handlers in libdrastic_arm64.so's static handler table, and inline-patch the
- * ARM7 I/O write16 handler, with wrappers that call the originals and log wifi
- * accesses. No emulation behaviour changes.
+ * Copyright (C) 2026 DraStic_rev_i18n contributors
  *
- * Output goes to logcat (tag "DraSticWFC") and, when writable, to
- * <external storage>/Android/data/<package>/files/wfc_log.txt.
+ * This program is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software
+ * Foundation, either version 3 of the License, or (at your option) any later
+ * version. See wfc/LICENSE.
+ *
+ * Replaces DraStic's ARM7 wifi stub with an emulated wifi chip (wifi.c) and a
+ * fake access point (wifi_ap.c):
+ *  - wifi reads: the wifi read handlers in the static handler table,
+ *  - wifi writes: inline patch of the ARM7 I/O write16/write32 handlers (the
+ *    recompiled code calls them directly),
+ *  - time: inline patch of the scanline event handler.
  *
  * Off by default. Enable before starting the app with:
- *   adb shell setprop debug.drastic.wfc 1   (summaries + register accesses)
- *   adb shell setprop debug.drastic.wfc 2   (also individual wifi RAM accesses)
+ *   adb shell setprop debug.drastic.wfc 1   (emulation + event log)
+ *   adb shell setprop debug.drastic.wfc 2   (+ register accesses)
+ *   adb shell setprop debug.drastic.wfc 3   (+ wifi RAM accesses)
+ * Output goes to logcat (tag "DraSticWFC").
  */
 
 #include <android/log.h>
@@ -24,44 +33,72 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "wfc.h"
 
 #define TAG "DraSticWFC"
 
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Bump on every change so logs show which build produced them. */
-#define WFC_VERSION 4
+#define WFC_VERSION 5
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
 #define TABLE_WIFI_READ  0x133bc8
 #define IO_WRITE16       0x25588
+#define IO_WRITE32       0x25da0
+#define SCANLINE_EVENT   0x2c8f8
 
 /*
  * Reads of 0x048xxxxx go through the wifi read table. Writes do not: the
- * recompiled ARM7 code calls the ARM7 I/O write16 handler directly (bl at
- * 0x831a4), which handles offsets >= 0x800000 inline (0x256d8). write32 drops
- * wifi writes and write8 does not handle them, so write16 is the only path.
+ * recompiled ARM7 code calls the ARM7 I/O write handlers directly (bl at
+ * 0x831a4), which handle offsets >= 0x800000 inline (write16 at 0x256d8;
+ * write32 drops them).
  */
 static const uintptr_t expected_read[3] = { 0x261b8, 0x261c0, 0x26274 };
 
-/* Prologue of IO_WRITE16: stp x24,x23,[sp,#-0x40]!; stp x22,x21,[sp,#0x10];
- * stp x20,x19,[sp,#0x20]; stp x29,x30,[sp,#0x30]. Position-independent, so it
- * can be moved into a trampoline as is. */
-static const uint32_t expected_prologue[4] = { 0xa9bc5ff8, 0xa90157f6, 0xa9024ff4, 0xa9037bfd };
+/* Prologue of IO_WRITE16 and IO_WRITE32: stp x24,x23,[sp,#-0x40]!;
+ * stp x22,x21,[sp,#0x10]; stp x20,x19,[sp,#0x20]; stp x29,x30,[sp,#0x30]. */
+static const uint32_t io_write_prologue[4] = { 0xa9bc5ff8, 0xa90157f6, 0xa9024ff4, 0xa9037bfd };
+/* Prologue of SCANLINE_EVENT: str x27,[sp,#-0x60]!; stp x26,x25,[sp,#0x10];
+ * stp x24,x23,[sp,#0x20]; stp x22,x21,[sp,#0x30]. */
+static const uint32_t scanline_prologue[4] = { 0xf81a0ffb, 0xa90167fa, 0xa9025ff8, 0xa90357f6 };
+
+/* ARM7 state layout, from the IRQ code in the I/O write handlers (0x25f3c)
+ * and the VBlank code in the scanline handler (0x2ca60). */
+#define STATE_ROOT     0xFBA88     /* handler state -> root pointer */
+#define ROOT_ARM7      0x1000010   /* root -> ARM7 cpu */
+#define CPU_IO         0x2080      /* cpu -> I/O register block */
+#define CPU_IRQ_PEND   0x2108
+#define CPU_IRQ_FLAGS  0x2110
+#define IO_IME         0x208
+#define IO_IE          0x210
+#define IO_IF          0x214
+#define IRQ_WIFI       (1u << 24)
+
+/* One scanline is 2130 cycles at 33.513982 MHz. */
+#define LINE_CYCLES 2130ull
+#define ARM7_HZ 33513982ull
 
 #define IS_WIFI(addr) (((addr) & 0xFFFFFF) >= 0x800000)
 
 typedef uint32_t (*read_fn)(void *state, uint32_t addr);
 typedef void (*write_fn)(void *state, uint32_t addr, uint32_t value);
+/* The scanline handler's exact arguments are unknown; forward all of them. */
+typedef void (*event_fn)(uint64_t, uint64_t, uint64_t, uint64_t,
+                         uint64_t, uint64_t, uint64_t, uint64_t);
 
 static read_fn orig_read[3];
 static write_fn orig_write16;
+static write_fn orig_write32;
+static event_fn orig_scanline;
 
-static FILE *log_file;
+int log_level;
+static uint8_t *wifi_state;
+static uint64_t line_us_frac;
 
 /* Per-register access statistics, indexed by (addr & 0xFFFF) >> 1. */
 #define REG_SLOTS 0x8000
@@ -69,19 +106,19 @@ static FILE *log_file;
 /* Hard cap on per-access lines so logging can never stall emulation for long. */
 #define DETAIL_TOTAL_LIMIT 2000
 
-static int log_level;
-static uint32_t detail_lines;
-
 typedef struct {
     uint32_t reads;
     uint32_t writes;
 } reg_stats;
 
+static uint32_t detail_lines;
 static reg_stats stats[REG_SLOTS];
 static uint64_t last_summary_ns;
 static uint64_t total_accesses;
+static uint32_t scanlines;
+static uint32_t wifi_irqs;
 
-static void log_line(const char *fmt, ...)
+void log_line(const char *fmt, ...)
 {
     char buf[256];
     va_list ap;
@@ -91,10 +128,6 @@ static void log_line(const char *fmt, ...)
     va_end(ap);
 
     __android_log_write(ANDROID_LOG_INFO, TAG, buf);
-    if (log_file) {
-        fputs(buf, log_file);
-        fputc('\n', log_file);
-    }
 }
 
 static uint64_t now_ns(void)
@@ -114,91 +147,154 @@ static void maybe_summarize(void)
         return;
     last_summary_ns = now;
 
-    log_line("--- summary (%llu accesses total) ---", (unsigned long long)total_accesses);
+    log_line("--- summary (%llu accesses, %u scanlines, %u wifi IRQs) ---",
+             (unsigned long long)total_accesses, scanlines, wifi_irqs);
+    scanlines = 0;
+    wifi_irqs = 0;
+    if (log_level < 2)
+        return;
     for (i = 0; i < REG_SLOTS; i++) {
         if (stats[i].reads > DETAIL_LIMIT || stats[i].writes > DETAIL_LIMIT)
             log_line("  reg %04X: %u reads, %u writes", i << 1, stats[i].reads, stats[i].writes);
         stats[i].reads = 0;
         stats[i].writes = 0;
     }
-    if (log_file)
-        fflush(log_file);
 }
 
-static void record(int is_write, int size, uint32_t addr, uint32_t value)
+static void record(int is_write, int size, uint32_t off, uint32_t value)
 {
-    reg_stats *s = &stats[(addr & 0xFFFF) >> 1];
+    reg_stats *s = &stats[(off & 0xFFFF) >> 1];
     uint32_t n = is_write ? ++s->writes : ++s->reads;
 
     total_accesses++;
-    if (total_accesses == 1)
-        log_line("first wifi access - hook is live");
+    if (log_level < 2)
+        return;
     /* 0x4000-0x5FFF is wifi RAM; the game self-tests all of it on boot. */
-    if ((addr & 0xC000) == 0x4000 && log_level < 2)
-        n = DETAIL_LIMIT + 1;
+    if ((off & 0xC000) == 0x4000 && log_level < 3)
+        return;
     if (n <= DETAIL_LIMIT && detail_lines < DETAIL_TOTAL_LIMIT && ++detail_lines)
-        log_line("%c%d %08X %s %08X", is_write ? 'W' : 'R', size, addr, is_write ? "<-" : "->", value);
-    maybe_summarize();
+        log_line("%c%d %04X %s %04X", is_write ? 'W' : 'R', size, off & 0xFFFF,
+                 is_write ? "<-" : "->", value);
 }
 
+/* ---- ARM7 interrupt ---- */
+
+void arm7_wifi_irq(void)
+{
+    uint8_t *root, *cpu, *io;
+    uint32_t *iflags, pending;
+
+    if (!wifi_state)
+        return;
+    root = *(uint8_t **)(wifi_state + STATE_ROOT);
+    cpu = *(uint8_t **)(root + ROOT_ARM7);
+    io = *(uint8_t **)(cpu + CPU_IO);
+
+    iflags = (uint32_t *)(io + IO_IF);
+    *iflags |= IRQ_WIFI;
+    if (!(cpu[CPU_IRQ_FLAGS] & 6)) {
+        pending = *(uint32_t *)(io + IO_IE) & *iflags & -*(uint32_t *)(io + IO_IME);
+        *(uint32_t *)(cpu + CPU_IRQ_PEND) = pending;
+    }
+    wifi_irqs++;
+}
+
+/* ---- hooks ---- */
+
+static void attach(void *state)
+{
+    if (wifi_state == state)
+        return;
+    if (wifi_state) {
+        log_line("wifi state pointer changed %p -> %p", (void *)wifi_state, state);
+    } else {
+        log_line("first wifi access - emulation is live");
+        wifi_reset();
+    }
+    wifi_state = state;
+}
+
+/* Read handlers get the offset inside 0x04800000. */
 static uint32_t hook_read8(void *state, uint32_t addr)
 {
-    uint32_t v = orig_read[0](state, addr);
-    record(0, 8, addr, v);
+    uint32_t off = addr & 0xFFFFF;
+    uint32_t v;
+
+    attach(state);
+    v = (wifi_read16(off & ~1u) >> ((off & 1) * 8)) & 0xFF;
+    record(0, 8, off, v);
     return v;
 }
 
 static uint32_t hook_read16(void *state, uint32_t addr)
 {
-    uint32_t v = orig_read[1](state, addr);
-    record(0, 16, addr, v);
+    uint32_t off = addr & 0xFFFFF;
+    uint32_t v;
+
+    attach(state);
+    v = wifi_read16(off);
+    record(0, 16, off, v);
+    maybe_summarize();
     return v;
 }
 
 static uint32_t hook_read32(void *state, uint32_t addr)
 {
-    uint32_t v = orig_read[2](state, addr);
-    record(0, 32, addr, v);
+    uint32_t off = addr & 0xFFFFF;
+    uint32_t v;
+
+    attach(state);
+    v = wifi_read16(off) | ((uint32_t)wifi_read16(off + 2) << 16);
+    record(0, 32, off, v);
     return v;
 }
 
+/* I/O write handlers get the offset inside 0x04000000. */
 static void hook_write16(void *state, uint32_t addr, uint32_t value)
 {
-    if (IS_WIFI(addr))
-        record(1, 16, addr, value);
-    orig_write16(state, addr, value);
-}
+    uint32_t off;
 
-static void open_log_file(void)
-{
-    char pkg[128] = { 0 };
-    char path[512];
-    const char *ext = getenv("EXTERNAL_STORAGE");
-    FILE *f = fopen("/proc/self/cmdline", "r");
-
-    if (f) {
-        size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
-        pkg[n] = '\0';
-        fclose(f);
-    }
-    if (!pkg[0])
+    if (!IS_WIFI(addr)) {
+        orig_write16(state, addr, value);
         return;
-    if (!ext)
-        ext = "/sdcard";
-
-    /* The app-specific external dir may not exist yet; it is ours to create. */
-    snprintf(path, sizeof(path), "%s/Android/data/%s", ext, pkg);
-    mkdir(path, 0770);
-    snprintf(path, sizeof(path), "%s/Android/data/%s/files", ext, pkg);
-    mkdir(path, 0770);
-
-    snprintf(path, sizeof(path), "%s/Android/data/%s/files/wfc_log.txt", ext, pkg);
-    log_file = fopen(path, "w");
-    if (log_file)
-        __android_log_print(ANDROID_LOG_INFO, TAG, "logging to %s", path);
-    else
-        __android_log_print(ANDROID_LOG_INFO, TAG, "cannot open %s: %s", path, strerror(errno));
+    }
+    off = (addr & 0xFFFFFF) - 0x800000;
+    attach(state);
+    record(1, 16, off, value & 0xFFFF);
+    wifi_write16(off, value);
 }
+
+static void hook_write32(void *state, uint32_t addr, uint32_t value)
+{
+    uint32_t off;
+
+    if (!IS_WIFI(addr)) {
+        orig_write32(state, addr, value);
+        return;
+    }
+    off = (addr & 0xFFFFFF) - 0x800000;
+    attach(state);
+    record(1, 32, off, value);
+    wifi_write16(off, value & 0xFFFF);
+    wifi_write16(off + 2, value >> 16);
+}
+
+static void hook_scanline(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{
+    if (wifi_state) {
+        uint32_t us;
+
+        line_us_frac += LINE_CYCLES * 1000000ull;
+        us = line_us_frac / ARM7_HZ;
+        line_us_frac %= ARM7_HZ;
+        wifi_advance(us);
+        scanlines++;
+    }
+    orig_scanline(a0, a1, a2, a3, a4, a5, a6, a7);
+}
+
+/* ---- installation ---- */
 
 /* ldr x16, #8; br x16; .quad target */
 static void put_abs_jump(uint32_t *at, uintptr_t target)
@@ -211,16 +307,17 @@ static void put_abs_jump(uint32_t *at, uintptr_t target)
 /*
  * Redirect the function at fn to hook. Returns a callable copy of the original
  * (relocated prologue + jump back), or NULL on failure with fn left untouched.
+ * The prologue must be four position-independent instructions.
  */
-static void *inline_hook(uintptr_t fn, void *hook)
+static void *inline_hook(uintptr_t fn, void *hook, const uint32_t prologue[4], const char *name)
 {
     long page = sysconf(_SC_PAGESIZE);
     uintptr_t start = fn & ~(uintptr_t)(page - 1);
     uintptr_t end = (fn + 16 + page - 1) & ~(uintptr_t)(page - 1);
     uint32_t *tramp;
 
-    if (memcmp((void *)fn, expected_prologue, sizeof(expected_prologue)) != 0) {
-        log_line("write16 prologue mismatch, not hooking writes");
+    if (memcmp((void *)fn, prologue, 16) != 0) {
+        log_line("%s prologue mismatch, not hooking", name);
         return NULL;
     }
 
@@ -229,7 +326,7 @@ static void *inline_hook(uintptr_t fn, void *hook)
         log_line("trampoline mmap failed: %s", strerror(errno));
         return NULL;
     }
-    memcpy(tramp, expected_prologue, sizeof(expected_prologue));
+    memcpy(tramp, prologue, 16);
     put_abs_jump(tramp + 4, fn + 16);
     if (mprotect(tramp, page, PROT_READ | PROT_EXEC) != 0) {
         log_line("trampoline mprotect failed: %s", strerror(errno));
@@ -279,6 +376,27 @@ static int install_hooks(void)
             return -1;
         }
     }
+    if (memcmp((void *)(base + IO_WRITE16), io_write_prologue, 16) != 0 ||
+        memcmp((void *)(base + IO_WRITE32), io_write_prologue, 16) != 0 ||
+        memcmp((void *)(base + SCANLINE_EVENT), scanline_prologue, 16) != 0) {
+        log_line("code mismatch (unsupported DraStic build), not hooking");
+        return -1;
+    }
+
+    /* Writes and time first: without them, emulated reads would be useless. */
+    orig_write16 = (write_fn)inline_hook(base + IO_WRITE16, (void *)hook_write16,
+                                         io_write_prologue, "write16");
+    if (!orig_write16)
+        return -1;
+    orig_write32 = (write_fn)inline_hook(base + IO_WRITE32, (void *)hook_write32,
+                                         io_write_prologue, "write32");
+    orig_scanline = (event_fn)inline_hook(base + SCANLINE_EVENT, (void *)hook_scanline,
+                                          scanline_prologue, "scanline");
+    if (!orig_write32 || !orig_scanline) {
+        /* write16 is already redirected; it is harmless without the rest. */
+        log_line("partial install, wifi emulation will not work");
+        return -1;
+    }
 
     for (i = 0; i < 3; i++)
         orig_read[i] = (read_fn)rtab[i];
@@ -290,17 +408,12 @@ static int install_hooks(void)
         log_line("mprotect RW failed: %s", strerror(errno));
         return -1;
     }
-
     rtab[0] = (uintptr_t)hook_read8;
     rtab[1] = (uintptr_t)hook_read16;
     rtab[2] = (uintptr_t)hook_read32;
-
     mprotect((void *)start, end - start, PROT_READ);
-    log_line("wifi read handlers hooked (core base %p)", (void *)base);
 
-    orig_write16 = (write_fn)inline_hook(base + IO_WRITE16, (void *)hook_write16);
-    if (orig_write16)
-        log_line("I/O write16 hooked");
+    log_line("wifi emulation installed (core base %p)", (void *)base);
     return 0;
 }
 
@@ -313,13 +426,13 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
 
     __system_property_get("debug.drastic.wfc", prop);
     log_level = atoi(prop);
-    __android_log_print(ANDROID_LOG_INFO, TAG, "libdrastic_wfc v%d, debug.drastic.wfc=%d", WFC_VERSION, log_level);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "libdrastic_wfc v%d, debug.drastic.wfc=%d",
+                        WFC_VERSION, log_level);
     if (log_level <= 0) {
         __android_log_write(ANDROID_LOG_INFO, TAG, "disabled (setprop debug.drastic.wfc 1 to enable)");
         return JNI_VERSION_1_6;
     }
 
-    open_log_file();
     last_summary_ns = now_ns();
     install_hooks();
     return JNI_VERSION_1_6;

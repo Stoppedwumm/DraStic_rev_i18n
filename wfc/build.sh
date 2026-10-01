@@ -12,6 +12,6 @@ OUT="$HERE/../universal/lib/arm64-v8a/libdrastic_wfc.so"
 
 "$CC" -shared -fPIC -O2 -Wall -Wextra -Werror \
     -Wl,-z,max-page-size=16384 -Wl,--build-id=none -s \
-    -o "$OUT" "$HERE/src/wfc_hook.c" -llog -ldl
+    -o "$OUT" "$HERE"/src/*.c -llog -ldl
 
 echo "built $OUT"
