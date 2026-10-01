@@ -73,6 +73,26 @@ static uint16_t csum_fold(uint32_t sum)
     return ~sum & 0xFFFF;
 }
 
+/* Hex dump of the first bytes of a connection, for protocol debugging. */
+static void dump_bytes(const char *dir, uint32_t offset, const uint8_t *p, int len)
+{
+    char line[3 * 32 + 1];
+    int i, n;
+
+    if (log_level < 1 || offset >= 128)
+        return;
+    if (len > (int)(128 - offset))
+        len = 128 - offset;
+    for (i = 0; i < len; i += 32) {
+        int j;
+
+        n = len - i < 32 ? len - i : 32;
+        for (j = 0; j < n; j++)
+            snprintf(line + 3 * j, 4, "%02x ", p[i + j]);
+        log_line("net:   %s +%u: %s", dir, offset + i, line);
+    }
+}
+
 static int set_nonblock(int fd)
 {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -571,6 +591,7 @@ static void handle_tcp(const uint8_t *ip, int iplen, int ihl)
 
             /* Only acknowledge what the socket took; the console resends the rest. */
             if (n > 0) {
+                dump_bytes("up  ", c->bytes_up, tcp + hl, n);
                 c->rcv_nxt += n;
                 c->bytes_up += n;
             }
@@ -633,6 +654,7 @@ static void poll_tcp_conn(tcp_conn *c)
         ssize_t n = recv(c->fd, c->buf + c->buflen, TCP_BUF - c->buflen, 0);
 
         if (n > 0) {
+            dump_bytes("down", c->bytes_down, c->buf + c->buflen, n);
             c->buflen += n;
             c->bytes_down += n;
         } else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
