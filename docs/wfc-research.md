@@ -99,15 +99,38 @@ writes it to `universal/lib/arm64-v8a/`). `DraSticJNI.<clinit>` loads it right a
 On load it checks that the handler table holds exactly the expected r2.6.0.4a pointers, then swaps in
 wrappers that call the original handlers and log accesses. Emulation behaviour is unchanged.
 
+The hook is **off by default** (the library loads but does nothing). Enable it before starting the app:
+
+```
+adb shell setprop debug.drastic.wfc 1   # register accesses + summaries
+adb shell setprop debug.drastic.wfc 2   # also individual wifi RAM accesses
+adb shell setprop debug.drastic.wfc 0   # off again
+```
+
+The property resets on reboot.
+
 Output (tag `DraSticWFC`):
 
 - `adb logcat -s DraSticWFC`, and/or
-- `Android/data/<package>/files/wfc_log.txt` (if the directory exists and is writable).
+- `Android/data/<package>/files/wfc_log.txt` (the directory is created if missing).
 
 What it logs: `wifi handlers hooked` at startup, `first wifi access - hook is live` once a game
-touches the wifi region, the first 16 reads/writes per register (`R16 04800000 -> 00000000`), and
-every ~2 s a summary of registers that were accessed more often than that.
+touches the wifi region, the first 4 reads/writes per register (`R16 04808000 -> 00000000`, capped at
+2000 lines in total so logging cannot stall emulation), and every ~2 s a summary of registers that
+were accessed more often than that.
 
 To test: open a WFC game, go into its Nintendo WFC / online menu and try to connect, then grab
 the log. If `wifi handlers hooked` appears but `hook is live` never does, the game never touched
 the wifi hardware (or the hook was installed too late).
+
+### First results (RG DS)
+
+- The hook is live; games run the normal wifi init: a full wifi RAM self-test (`0x4000`–`0x5FFF`),
+  register mask tests, BB/RF busy polling (`0x15E`, `0x180`), baseband reads (`0x158`/`0x15C`),
+  `W_RANDOM` (`0x044`, always 0 in the stub).
+- Registers are accessed through the `+0x8000` mirror (`0x04808000`…).
+- **No writes were logged**, yet written values read back correctly. So DraStic's write path does
+  not go through the slots at `0x133be0`; writes must be dispatched from another table or inlined.
+  This has to be found before a wifi chip can be emulated.
+- The first build logged every RAM access synchronously (~30k lines), which coincided with graphics
+  glitches. Logging is now throttled and gated behind the property above.

@@ -7,6 +7,10 @@
  *
  * Output goes to logcat (tag "DraSticWFC") and, when writable, to
  * <external storage>/Android/data/<package>/files/wfc_log.txt.
+ *
+ * Off by default. Enable before starting the app with:
+ *   adb shell setprop debug.drastic.wfc 1   (summaries + register accesses)
+ *   adb shell setprop debug.drastic.wfc 2   (also individual wifi RAM accesses)
  */
 
 #include <android/log.h>
@@ -19,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -43,7 +49,12 @@ static FILE *log_file;
 
 /* Per-register access statistics, indexed by (addr & 0xFFFF) >> 1. */
 #define REG_SLOTS 0x8000
-#define DETAIL_LIMIT 16
+#define DETAIL_LIMIT 4
+/* Hard cap on per-access lines so logging can never stall emulation for long. */
+#define DETAIL_TOTAL_LIMIT 2000
+
+static int log_level;
+static uint32_t detail_lines;
 
 typedef struct {
     uint32_t reads;
@@ -106,7 +117,10 @@ static void record(int is_write, int size, uint32_t addr, uint32_t value)
     total_accesses++;
     if (total_accesses == 1)
         log_line("first wifi access - hook is live");
-    if (n <= DETAIL_LIMIT)
+    /* 0x4000-0x5FFF is wifi RAM; the game self-tests all of it on boot. */
+    if ((addr & 0xC000) == 0x4000 && log_level < 2)
+        n = DETAIL_LIMIT + 1;
+    if (n <= DETAIL_LIMIT && detail_lines < DETAIL_TOTAL_LIMIT && ++detail_lines)
         log_line("%c%d %08X %s %08X", is_write ? 'W' : 'R', size, addr, is_write ? "<-" : "->", value);
     maybe_summarize();
 }
@@ -166,6 +180,12 @@ static void open_log_file(void)
         return;
     if (!ext)
         ext = "/sdcard";
+
+    /* The app-specific external dir may not exist yet; it is ours to create. */
+    snprintf(path, sizeof(path), "%s/Android/data/%s", ext, pkg);
+    mkdir(path, 0770);
+    snprintf(path, sizeof(path), "%s/Android/data/%s/files", ext, pkg);
+    mkdir(path, 0770);
 
     snprintf(path, sizeof(path), "%s/Android/data/%s/files/wfc_log.txt", ext, pkg);
     log_file = fopen(path, "w");
@@ -233,8 +253,17 @@ static int install_hooks(void)
 
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
 {
+    char prop[PROP_VALUE_MAX] = { 0 };
+
     (void)vm;
     (void)reserved;
+
+    __system_property_get("debug.drastic.wfc", prop);
+    log_level = atoi(prop);
+    if (log_level <= 0) {
+        __android_log_write(ANDROID_LOG_INFO, TAG, "disabled (setprop debug.drastic.wfc 1 to enable)");
+        return JNI_VERSION_1_6;
+    }
 
     open_log_file();
     last_summary_ns = now_ns();
