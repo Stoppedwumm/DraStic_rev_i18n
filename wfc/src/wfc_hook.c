@@ -44,7 +44,7 @@
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Bump on every change so logs show which build produced them. */
-#define WFC_VERSION 6
+#define WFC_VERSION 7
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
 #define TABLE_WIFI_READ  0x133bc8
@@ -435,6 +435,9 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
         __android_log_write(ANDROID_LOG_INFO, TAG, "disabled (setprop debug.drastic.wfc 1 to enable)");
         return JNI_VERSION_1_6;
     }
+
+    __system_property_get("debug.drastic.wfc.dns", prop);
+    net_init(prop);
 
     last_summary_ns = now_ns();
     install_hooks();

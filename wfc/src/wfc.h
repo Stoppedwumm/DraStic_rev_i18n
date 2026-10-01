@@ -34,5 +34,14 @@ void ap_ms_timer(void);
 void ap_send(const uint8_t *data, int len);
 /* Next frame for the console (12-byte header + IEEE frame incl. FCS), or 0. */
 int ap_recv(uint8_t *data);
+const uint8_t *ap_bssid(void);
+/* Queue an Ethernet frame for delivery to the console. */
+void ap_queue_eth(const uint8_t *eth, int len);
+
+/* net.c - NAT between the console and the internet. */
+void net_init(const char *dns);
+void net_reset(void);
+void net_input(const uint8_t *eth, int len);
+void net_poll(void);
 
 #endif

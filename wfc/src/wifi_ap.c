@@ -29,7 +29,14 @@ static int packet_len;
 static int rx_pending;
 /* 0 = idle, 1 = authenticated, 2 = associated */
 static int client_status;
-static uint32_t data_frames_dropped;
+
+/* Ethernet frames waiting to be delivered to the console as data frames. */
+#define QUEUE_LEN 64
+#define QUEUE_FRAME 1600
+static uint8_t queue[QUEUE_LEN][QUEUE_FRAME];
+static int queue_len[QUEUE_LEN];
+static int queue_head, queue_count;
+static uint32_t queue_drops;
 
 #define PUT8(p, v) (*(p)++ = (uint8_t)(v))
 #define PUT16(p, v) do { uint16_t v_ = (v); memcpy((p), &v_, 2); (p) += 2; } while (0)
@@ -51,7 +58,31 @@ void ap_reset(void)
     packet_len = 0;
     rx_pending = 0;
     client_status = 0;
-    data_frames_dropped = 0;
+    queue_head = 0;
+    queue_count = 0;
+    net_reset();
+}
+
+const uint8_t *ap_bssid(void)
+{
+    return ap_mac;
+}
+
+void ap_queue_eth(const uint8_t *eth, int len)
+{
+    int slot;
+
+    if (len > QUEUE_FRAME)
+        return;
+    if (queue_count == QUEUE_LEN) {
+        if (log_level >= 1 && (++queue_drops & 63) == 1)
+            log_line("ap: queue full, dropped %u frame(s)", queue_drops);
+        return;
+    }
+    slot = (queue_head + queue_count) % QUEUE_LEN;
+    memcpy(queue[slot], eth, len);
+    queue_len[slot] = len;
+    queue_count++;
 }
 
 void ap_ms_timer(void)
@@ -60,6 +91,8 @@ void ap_ms_timer(void)
     /* beacon every 128ms */
     if (!((uint32_t)ap_us_counter & 0x1FC00))
         beacon_due = 1;
+    if (client_status == 2)
+        net_poll();
 }
 
 /* Start of a management frame from the AP to the client at addr2 of `req`. */
@@ -195,15 +228,26 @@ void ap_send(const uint8_t *data, int len)
     case 0:
         handle_mgmt(data);
         break;
-    case 2:
-        if ((framectl & 0x0300) != 0x0100)
+    case 2: {
+        /* ToDS data frame: 802.11 header, LLC/SNAP, payload, FCS. */
+        static const uint8_t snap[6] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
+        uint8_t eth[QUEUE_FRAME];
+        int flen = len - 12, plen;
+
+        if ((framectl & 0x0300) != 0x0100 || (framectl & 0x4000) || client_status != 2)
             return;
-        /* Network bridge not implemented yet. */
-        data_frames_dropped++;
-        if (log_level >= 1 && (data_frames_dropped & (data_frames_dropped - 1)) == 0)
-            log_line("ap: %u data frame(s) from client dropped (no network bridge yet)",
-                     data_frames_dropped);
+        if ((framectl & 0xF0) != 0)
+            return;   /* null/QoS-less subtypes without payload */
+        plen = flen - 24 - 8 - 4;
+        if (plen <= 0 || 14 + plen > (int)sizeof(eth) || memcmp(&data[24], snap, 6) != 0)
+            return;
+        memcpy(eth, &data[16], 6);        /* DA = addr3 */
+        memcpy(eth + 6, &data[10], 6);    /* SA = addr2 */
+        memcpy(eth + 12, &data[30], 2);   /* ethertype */
+        memcpy(eth + 14, &data[32], plen);
+        net_input(eth, 14 + plen);
         break;
+    }
     }
 }
 
@@ -254,6 +298,30 @@ int ap_recv(uint8_t *data)
         rx_pending = 0;
         memcpy(p, packet_buffer, packet_len);
         return finish_frame(data, p + packet_len);
+    }
+
+    if (queue_count && client_status == 2) {
+        const uint8_t *eth = queue[queue_head];
+        int elen = queue_len[queue_head];
+
+        queue_head = (queue_head + 1) % QUEUE_LEN;
+        queue_count--;
+
+        PUT16(p, 0x0208);         /* data, FromDS */
+        PUT16(p, 0);
+        PUTMAC(p, eth);           /* DA */
+        PUTMAC(p, ap_mac);        /* BSSID */
+        PUTMAC(p, eth + 6);       /* SA */
+        PUTSEQ(p);
+        PUT8(p, 0xAA);
+        PUT8(p, 0xAA);
+        PUT8(p, 0x03);
+        PUT8(p, 0);
+        PUT8(p, 0);
+        PUT8(p, 0);
+        memcpy(p, eth + 12, elen - 12);   /* ethertype + payload */
+        p += elen - 12;
+        return finish_frame(data, p);
     }
 
     return 0;

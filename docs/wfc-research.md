@@ -193,8 +193,8 @@ answers probe requests, authentication and association. **It answers on every ch
 DraStic's built-in firmware has no RF channel tables (the RF writes in the log are all zero), so the
 selected channel cannot be decoded.
 
-Not done yet: the network bridge. Data frames from the console (DHCP, DNS, …) are dropped and
-counted, so a connection test will still fail after association.
+Result on the RG DS (v6): the game finds `DraSticWFC`, authenticates and associates, then fails
+with **error 52000** (no IP address), because data frames were dropped.
 
 Checked on the host by replaying the v4 register log against `wifi.c`: the transceiver powers up
 (`W_RF_STATUS` = 1, `W_RF_PINS` = `0x84`), beacons land in the RX ring with header flags `0x0011`,
@@ -202,3 +202,23 @@ and IRQ0/IRQ6 fire.
 
 Enable with `adb shell setprop debug.drastic.wfc 1` (`2` adds register accesses, `3` wifi RAM).
 With `0` / unset, DraStic's stock stub is used.
+
+## Step 3: network bridge (`wfc/src/net.c`, v7)
+
+Data frames from the console (ToDS, LLC/SNAP) are turned into Ethernet frames and handed to a
+small user-mode NAT; replies are queued and delivered as FromDS data frames.
+
+- Virtual network like slirp: gateway `10.0.2.2`, DNS `10.0.2.3`, console `10.0.2.15`/24.
+- ARP: every address in the subnet except the console answers with the AP's MAC.
+- DHCP: answers DISCOVER/REQUEST with OFFER/ACK (router, DNS, 24h lease).
+- DNS: queries to `10.0.2.3:53` are forwarded to **95.217.77.181** (Wiimmfi), overridable with
+  `adb shell setprop debug.drastic.wfc.dns <ip>`.
+- UDP: one non-blocking socket per console source port.
+- TCP: terminated locally; a non-blocking `connect()` per connection, SYN-ACK once it succeeds,
+  data relayed both ways with go-back-N retransmission (400 ms) toward the console, which only ever
+  gets acknowledgements for bytes the socket accepted.
+- Everything runs on the emulation thread from `ap_ms_timer()` (once per emulated millisecond).
+- The APK now requests `android.permission.INTERNET`.
+
+Host test (fake console against `net.c`): DHCP offer for `10.0.2.15`, TCP handshake, echo data in
+both directions and FIN all work, and every generated IP/UDP/TCP checksum verifies.
