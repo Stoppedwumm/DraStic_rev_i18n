@@ -246,26 +246,9 @@ answered by Wiimmfi's NAS (`78.46.231.155:443`) with a fatal `handshake_failure`
 (`15 03 00 00 02 02 28`), so unpatched games fail with error 20100 there. With ROMs patched for
 Wiimmfi (Wiimmfi's NDS patcher / WFCPatcher "NoSSL"), WFC works on the RG DS through this build.
 
-## Step 4: local multiplayer (v11, untested on device)
+## Local multiplayer: not supported
 
-`wifi.c` now also ports melonDS's multiplay parts: CMD transfers with reply windows and acks
-(host), automatic replies to CMD frames (client), the client clock sync (a client blocks for the
-host's next frame once its clock reaches `next_sync`), the MP frame types in the RX filter, and
-`W_TXBUF_BEACON` / `W_TXBUF_CMD` / `W_CMD_COUNT`. While a game hosts or joins a session the fake AP
-is bypassed.
-
-`mp.c` is the transport between DraStic instances, with the semantics of melonDS's LAN backend
-over plain UDP: frames carry a sender ID, type (packet/cmd/reply+AID/ack) and timestamp; host
-frames and replies are received with a 25 ms timeout, which keeps the consoles in lockstep.
-Each instance binds the first free port in 7064–7071 and announces itself every 500 ms to all
-those ports on 127.0.0.1 (several instances on one device) and on the broadcast address (other
-devices on the same network). Host test: two processes find each other and do 500/500
-CMD→reply→ack round trips (0.04 ms average over loopback).
-
-Testing on one device: `wfc/make_p2.sh apktool.jar uber-apk-signer.jar` builds a second copy
-(`com.dsemu.drastic.p2`, "DraStic P2") that installs next to the normal one. Every package other
-than `com.dsemu.drastic` saves its firmware as `system/nds_firmware_XX_modif.bin` (XX = last two
-characters of the package name; the string at `0x10eebc` is patched), so it gets its own
-generated MAC. Use a differently named copy of the ROM for P2 so the saves stay separate.
-
-Not done yet: discovery/connection UI (BLE handshake, automatic hotspot), Download Play.
+The chip port leaves out multiplayer CMD/REPLY/ACK (`W_TXBUF_CMD`, replies, `W_CMD_COUNT`), and the
+AP only bridges infrastructure traffic to the internet. Local play would need frames exchanged
+between two devices plus tight timing sync (replies are expected within a few hundred µs of a
+CMD), i.e. pausing DraStic's emulation in lockstep with the other console.

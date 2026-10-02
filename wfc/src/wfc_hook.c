@@ -45,7 +45,7 @@
 #define CORE_LIB "libdrastic_arm64.so"
 
 /* Bump on every change so logs show which build produced them. */
-#define WFC_VERSION 11
+#define WFC_VERSION 10
 
 /* Offsets in libdrastic_arm64.so r2.6.0.4a (BuildID 2318f180e6c9aca2...). */
 #define TABLE_WIFI_READ  0x133bc8
@@ -55,8 +55,6 @@
 /* Default firmware MAC + channel mask, copied to firmware+0x36 by the firmware
  * generator at 0x2a9fc when no nds_firmware(_modified).bin exists. */
 #define DEFAULT_FW_MAC   0x10d6f0
-/* "nds_firmware_modified.bin" inside "%s%csystem%cnds_firmware_modified.bin". */
-#define FW_MODIFIED_NAME 0x10eebc
 
 /*
  * Reads of 0x048xxxxx go through the wifi read table. Writes do not: the
@@ -430,53 +428,6 @@ static void get_console_mac(uint8_t mac[6])
     }
 }
 
-/*
- * A second copy of DraStic installed under another package name (to test local
- * multiplayer on one device) shares /sdcard/DraStic, and with it the saved
- * firmware and its MAC. Two consoles with the same MAC cannot play together, so
- * every package other than com.dsemu.drastic saves its firmware under its own
- * name: nds_firmware_modified.bin -> nds_firmware_XX_modif.bin (same length,
- * XX from the package name), which is then generated with its own MAC.
- */
-static void patch_firmware_name(uintptr_t base)
-{
-    static const char orig[] = "nds_firmware_modified.bin";
-    long page = sysconf(_SC_PAGESIZE);
-    char *p = (char *)(base + FW_MODIFIED_NAME);
-    uintptr_t start = (uintptr_t)p & ~(uintptr_t)(page - 1);
-    uintptr_t end = ((uintptr_t)p + sizeof(orig) + page - 1) & ~(uintptr_t)(page - 1);
-    char pkg[128] = { 0 }, name[sizeof(orig)];
-    const char *suffix;
-    size_t n;
-    FILE *f;
-
-    f = fopen("/proc/self/cmdline", "r");
-    if (f) {
-        n = fread(pkg, 1, sizeof(pkg) - 1, f);
-        pkg[n] = '\0';
-        fclose(f);
-    }
-    if (!pkg[0] || strcmp(pkg, "com.dsemu.drastic") == 0)
-        return;
-    if (memcmp(p, orig, sizeof(orig)) != 0) {
-        log_line("firmware file name not found, not patching");
-        return;
-    }
-
-    /* Last two characters of the package name, e.g. "p2". */
-    n = strlen(pkg);
-    suffix = n >= 2 ? pkg + n - 2 : "xx";
-    snprintf(name, sizeof(name), "nds_firmware_%c%c_modif.bin", suffix[0], suffix[1]);
-    if (strlen(name) != sizeof(orig) - 1)
-        return;
-
-    if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
-        return;
-    memcpy(p, name, sizeof(orig) - 1);
-    mprotect((void *)start, end - start, PROT_READ | PROT_EXEC);
-    log_line("package %s: saving firmware as system/%s", pkg, name);
-}
-
 static void patch_default_mac(uintptr_t base)
 {
     long page = sysconf(_SC_PAGESIZE);
@@ -568,7 +519,6 @@ static int install_hooks(void)
     rtab[2] = (uintptr_t)hook_read32;
     mprotect((void *)start, end - start, PROT_READ);
 
-    patch_firmware_name(base);
     patch_default_mac(base);
     log_line("wifi emulation installed (core base %p)", (void *)base);
     return 0;
@@ -592,7 +542,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
 
     __system_property_get("debug.drastic.wfc.dns", prop);
     net_init(prop);
-    mp_init();
 
     last_summary_ns = now_ns();
     install_hooks();
