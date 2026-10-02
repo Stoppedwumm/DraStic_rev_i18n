@@ -238,3 +238,17 @@ v8 patches those 6 bytes before the game starts: `debug.drastic.wfc.mac` if set,
 that is then saved there, so the WFC ID Wiimmfi registers stays valid across restarts. A firmware
 already saved as `nds_firmware_modified.bin` keeps the old MAC; the chip logs a warning when the
 game still writes 00:01:02:03:04:05 to W_MACADDR.
+
+### v10 result: SSL vs. patched ROMs
+
+The byte dump shows the console's standard DS ClientHello (SSLv3, RC4-MD5/RC4-SHA only) being
+answered by Wiimmfi's NAS (`78.46.231.155:443`) with a fatal `handshake_failure` alert
+(`15 03 00 00 02 02 28`), so unpatched games fail with error 20100 there. With ROMs patched for
+Wiimmfi (Wiimmfi's NDS patcher / WFCPatcher "NoSSL"), WFC works on the RG DS through this build.
+
+## Local multiplayer: not supported
+
+The chip port leaves out multiplayer CMD/REPLY/ACK (`W_TXBUF_CMD`, replies, `W_CMD_COUNT`), and the
+AP only bridges infrastructure traffic to the internet. Local play would need frames exchanged
+between two devices plus tight timing sync (replies are expected within a few hundred µs of a
+CMD), i.e. pausing DraStic's emulation in lockstep with the other console.
