@@ -46,4 +46,19 @@ void net_reset(void);
 void net_input(const uint8_t *eth, int len);
 void net_poll(void);
 
+/* mp.c - local multiplayer transport between DraStic instances. */
+void mp_init(void);
+void mp_begin(void);
+void mp_end(void);
+void mp_poll(void);
+int mp_send_packet(const uint8_t *data, int len, uint64_t timestamp);
+int mp_send_cmd(const uint8_t *data, int len, uint64_t timestamp);
+int mp_send_reply(const uint8_t *data, int len, uint64_t timestamp, uint16_t aid);
+int mp_send_ack(const uint8_t *data, int len, uint64_t timestamp);
+int mp_recv_packet(uint8_t *data, uint64_t *timestamp);
+/* Blocks up to 25 ms; -1 if the host is gone. */
+int mp_recv_host_packet(uint8_t *data, uint64_t *timestamp);
+/* Blocks until every peer replied (or 25 ms); returns the AIDs that replied. */
+uint16_t mp_recv_replies(uint8_t *packets, uint64_t timestamp, uint16_t aidmask);
+
 #endif

@@ -128,8 +128,8 @@ static int block_beacon_irq14;
 static int32_t us_until_power_on;
 static uint32_t cmd_counter;
 
-/* Slots: 0=LOC1, 1=CMD (not emulated), 2=LOC2, 3=LOC3, 4=beacon. */
-static tx_slot tx_slots[5];
+/* Slots: 0=LOC1, 1=CMD, 2=LOC2, 3=LOC3, 4=beacon, 5=MP reply. */
+static tx_slot tx_slots[6];
 static int tx_cur = -1;
 static int com_status;   /* bit0 = receiving, bit1 = transmitting */
 static uint32_t rx_counter;
@@ -137,6 +137,18 @@ static uint8_t rx_buffer[2048];
 static int32_t rx_time;
 static uint8_t tx_buffer[2048];
 static uint32_t step_remainder;
+
+/* Local multiplayer state. */
+static int is_mp;            /* in a multiplay session (host or client) */
+static int is_mp_client;
+static int power_on;         /* W_POWER_US enabled: MP transport active */
+static uint64_t next_sync;   /* client: block for host frames from here on */
+static uint64_t rx_timestamp;
+static uint16_t mp_client_mask;
+static uint16_t mp_client_fail;
+static int32_t mp_reply_timer;
+static uint16_t mp_last_seqno;
+static uint8_t mp_client_replies[15 * 1024];
 
 const uint8_t *wifi_mac(void)
 {
@@ -187,6 +199,17 @@ void wifi_reset(void)
     rx_counter = 0;
     rx_time = 0;
     step_remainder = 0;
+    is_mp = 0;
+    is_mp_client = 0;
+    if (power_on)
+        mp_end();
+    power_on = 0;
+    next_sync = 0;
+    rx_timestamp = 0;
+    mp_client_mask = 0;
+    mp_client_fail = 0;
+    mp_reply_timer = 0;
+    mp_last_seqno = 0xFFFF;
 
     ap_reset();
 }
@@ -334,6 +357,11 @@ static void update_power_status(int power)
 
 /* ---- transmit ---- */
 
+/* Destination MACs the hardware recognises for multiplay frames. */
+static const uint8_t mp_cmd_mac[6] = { 0x03, 0x09, 0xBF, 0x00, 0x00, 0x00 };
+static const uint8_t mp_reply_mac[6] = { 0x03, 0x09, 0xBF, 0x00, 0x00, 0x10 };
+static const uint8_t mp_ack_mac[6] = { 0x03, 0x09, 0xBF, 0x00, 0x00, 0x03 };
+
 static int preamble_len(int rate)
 {
     if (rate == 1)
@@ -341,6 +369,37 @@ static int preamble_len(int rate)
     return (REG(W_PREAMBLE) & 4) ? 96 : 192;
 }
 
+static int num_clients(uint16_t bitmask)
+{
+    int i, n = 0;
+
+    for (i = 1; i < 16; i++) {
+        if (bitmask & (1 << i))
+            n++;
+    }
+    return n;
+}
+
+static void increment_tx_count(const tx_slot *slot)
+{
+    uint8_t cnt = ram[slot->addr + 4];
+
+    if (cnt < 0xFF)
+        cnt++;
+    RAM16(slot->addr + 4) = cnt;
+}
+
+static void report_mp_reply_errors(uint16_t clientfail)
+{
+    int i;
+
+    for (i = 1; i < 16; i++) {
+        if (clientfail & (1 << i))
+            ((uint8_t *)&REG(W_CMD_STAT0))[i]++;
+    }
+}
+
+/* num: 0=LOC1, 1=CMD, 2=LOC2, 3=LOC3, 4=beacon, 5=MP reply */
 static void tx_send_frame(tx_slot *slot, int num)
 {
     int noseqno = 0;
@@ -348,6 +407,8 @@ static void tx_send_frame(tx_slot *slot, int num)
 
     if (ram[slot->addr + 4])
         noseqno = 2;
+    else if (num == 1)
+        noseqno = (REG(W_TXBUF_CMD) & 0x4000) ? 1 : 0;
 
     if (!noseqno) {
         if (!(REG(W_TX_HDR_CNT) & (1 << 2)))
@@ -373,8 +434,27 @@ static void tx_send_frame(tx_slot *slot, int num)
         *(uint16_t *)&tx_buffer[0xC] |= 1 << 11;
     tx_buffer[9] = AP_CHANNEL;
 
-    if (num == 0 || num == 2 || num == 3)
-        ap_send(tx_buffer, 12 + len);
+    switch (num) {
+    case 0:
+    case 2:
+    case 3:
+        mp_send_packet(tx_buffer, 12 + len, us_timestamp);
+        if (!is_mp)
+            ap_send(tx_buffer, 12 + len);
+        break;
+    case 1:
+        *(uint16_t *)&tx_buffer[12 + 24 + 2] = mp_client_mask;
+        mp_send_cmd(tx_buffer, 12 + len, us_timestamp);
+        break;
+    case 5:
+        increment_tx_count(slot);
+        mp_send_reply(tx_buffer, 12 + len, us_timestamp, REG(W_AID_LOW));
+        break;
+    case 4:
+        memcpy(&tx_buffer[0xC + 24], &us_counter, 8);
+        mp_send_packet(tx_buffer, 12 + len, us_timestamp);
+        break;
+    }
 }
 
 static void start_tx_loc(int nslot, int loc)
@@ -387,6 +467,35 @@ static void start_tx_loc(int nslot, int loc)
     slot->rate = ram[slot->addr + 8] == 0x14 ? 2 : 1;
     slot->phase = 0;
     slot->phase_time = preamble_len(slot->rate);
+}
+
+static void start_tx_cmd(void)
+{
+    tx_slot *slot = &tx_slots[1];
+    int32_t duration;
+
+    slot->valid = 1;
+    slot->addr = (REG(W_TXBUF_CMD) & 0x0FFF) << 1;
+    slot->length = RAM16(slot->addr + 0xA) & 0x3FFF;
+    slot->rate = ram[slot->addr + 8] == 0x14 ? 2 : 1;
+
+    mp_client_mask = RAM16(slot->addr + 12 + 24 + 2) & mp_client_fail;
+    mp_client_fail &= mp_client_mask;
+
+    duration = preamble_len(slot->rate) + slot->length * (slot->rate == 2 ? 4 : 8);
+    duration += 112 + (10 + REG(W_CMD_REPLYTIME)) * num_clients(mp_client_mask);
+    duration += 32 * (slot->rate == 2 ? 4 : 8);
+
+    if ((int32_t)cmd_counter > duration + 100) {
+        slot->phase = 0;
+        slot->phase_time = preamble_len(slot->rate);
+    } else {
+        slot->phase = 13;
+        slot->phase_time = (int32_t)cmd_counter - 100;
+    }
+
+    /* Starting a CMD transfer wakes the transceiver up. */
+    update_power_status(1);
 }
 
 static void start_tx_beacon(void)
@@ -413,64 +522,287 @@ static void fire_tx(void)
     txbusy = REG(W_TXBUSY);
     if (REG(W_TXBUF_LOC1) & 0x8000)
         txstart |= 0x0001;
+    if (REG(W_TXBUF_CMD) & 0x8000)
+        txstart |= 0x0002;
     if (REG(W_TXBUF_LOC1 + 4) & 0x8000)
         txstart |= 0x0004;
     if (REG(W_TXBUF_LOC1 + 8) & 0x8000)
         txstart |= 0x0008;
-    /* CMD (multiplay) transfers are not emulated. */
 
     txstart &= REG(W_TXREQ_READ);
     txstart &= ~txbusy;
     REG(W_TXBUSY) = txbusy | txstart;
 
-    if (txstart & 0x0008)
+    if (txstart & 0x0008) {
         start_tx_loc(3, 2);
-    else if (txstart & 0x0004)
+    } else if (txstart & 0x0004) {
         start_tx_loc(2, 1);
-    else if (txstart & 0x0001)
+    } else if (txstart & 0x0002) {
+        mp_client_fail = 0xFFFE;
+        start_tx_cmd();
+    } else if (txstart & 0x0001) {
         start_tx_loc(0, 0);
+    }
 }
+
+static void send_mp_default_reply(void)
+{
+    uint8_t reply[12 + 28];
+
+    memset(reply, 0, sizeof(reply));
+    *(uint16_t *)&reply[0xA] = 28;
+    reply[0x8] = 0x14;
+    reply[0x9] = AP_CHANNEL;
+
+    *(uint16_t *)&reply[0xC + 0x00] = 0x0158;
+    *(uint16_t *)&reply[0xC + 0x02] = 0x00F0;
+    *(uint16_t *)&reply[0xC + 0x04] = REG(W_BSSID0);
+    *(uint16_t *)&reply[0xC + 0x06] = REG(W_BSSID0 + 2);
+    *(uint16_t *)&reply[0xC + 0x08] = REG(W_BSSID0 + 4);
+    *(uint16_t *)&reply[0xC + 0x0A] = REG(W_MACADDR0);
+    *(uint16_t *)&reply[0xC + 0x0C] = REG(W_MACADDR0 + 2);
+    *(uint16_t *)&reply[0xC + 0x0E] = REG(W_MACADDR0 + 4);
+    *(uint16_t *)&reply[0xC + 0x10] = 0x0903;
+    *(uint16_t *)&reply[0xC + 0x12] = 0x00BF;
+    *(uint16_t *)&reply[0xC + 0x14] = 0x1000;
+    *(uint16_t *)&reply[0xC + 0x16] = REG(W_TX_SEQNO) << 4;
+
+    mp_send_reply(reply, sizeof(reply), us_timestamp, REG(W_AID_LOW));
+}
+
+static void send_mp_reply(uint16_t clienttime, uint16_t clientmask)
+{
+    tx_slot *slot = &tx_slots[5];
+    uint16_t clientnum = 0;
+    int i;
+
+    /* Mark the previous reply as sent. */
+    if (REG(W_TXBUF_REPLY2) & 0x8000)
+        RAM16(slot->addr) = 0x0001;
+
+    slot->rate = 2;
+
+    REG(W_TXBUF_REPLY2) = REG(W_TXBUF_REPLY1);
+    REG(W_TXBUF_REPLY1) = 0;
+
+    if (!(REG(W_TXBUF_REPLY2) & 0x8000)) {
+        slot->valid = 0;
+    } else {
+        slot->valid = 1;
+        slot->addr = (REG(W_TXBUF_REPLY2) & 0x0FFF) << 1;
+        slot->length = RAM16(slot->addr + 0xA) & 0x3FFF;
+
+        /* A reply longer than the allowed reply time is dropped. */
+        if (preamble_len(slot->rate) + slot->length * 4 > clienttime)
+            slot->valid = 0;
+    }
+
+    if (slot->valid) {
+        slot->phase = 0;
+        tx_send_frame(slot, 5);
+    } else {
+        slot->phase = 10;
+        send_mp_default_reply();
+    }
+
+    for (i = 1; i < REG(W_AID_LOW); i++) {
+        if (clientmask & (1 << i))
+            clientnum++;
+    }
+    slot->phase_time = 16 + (clienttime + 10) * clientnum + preamble_len(slot->rate);
+
+    REG(W_TXBUSY) |= 0x0080;
+}
+
+static void send_mp_ack(uint16_t cmdcount, uint16_t clientfail)
+{
+    uint8_t ack[12 + 32];
+
+    memset(ack, 0, sizeof(ack));
+    *(uint16_t *)&ack[0xA] = 32;
+    ack[0x8] = tx_slots[1].rate == 2 ? 0x14 : 0x0A;
+    ack[0x9] = AP_CHANNEL;
+
+    *(uint16_t *)&ack[0xC + 0x00] = 0x0218;
+    *(uint16_t *)&ack[0xC + 0x02] = 0;
+    *(uint16_t *)&ack[0xC + 0x04] = 0x0903;
+    *(uint16_t *)&ack[0xC + 0x06] = 0x00BF;
+    *(uint16_t *)&ack[0xC + 0x08] = 0x0300;
+    *(uint16_t *)&ack[0xC + 0x0A] = REG(W_BSSID0);
+    *(uint16_t *)&ack[0xC + 0x0C] = REG(W_BSSID0 + 2);
+    *(uint16_t *)&ack[0xC + 0x0E] = REG(W_BSSID0 + 4);
+    *(uint16_t *)&ack[0xC + 0x10] = REG(W_MACADDR0);
+    *(uint16_t *)&ack[0xC + 0x12] = REG(W_MACADDR0 + 2);
+    *(uint16_t *)&ack[0xC + 0x14] = REG(W_MACADDR0 + 4);
+    *(uint16_t *)&ack[0xC + 0x16] = REG(W_TX_SEQNO) << 4;
+    *(uint16_t *)&ack[0xC + 0x18] = cmdcount;
+    *(uint16_t *)&ack[0xC + 0x1A] = clientfail;
+
+    /* The ack carries how far clients may run ahead before the next sync. */
+    if (!clientfail) {
+        uint32_t nextbeacon;
+        int32_t runahead;
+
+        if (REG(W_TXBUSY) & 0x0010)
+            nextbeacon = 0;
+        else
+            nextbeacon = ((REG(W_BEACON_COUNT) - 1) << 10) + (0x400 - (us_counter & 0x3FF));
+        runahead = (int32_t)(cmd_counter < nextbeacon ? cmd_counter : nextbeacon);
+        if (cmd_counter < 1000)
+            runahead -= 210;
+        runahead -= 32 * (tx_slots[1].rate == 2 ? 4 : 8);
+        *(uint32_t *)&ack[0] = runahead > 0 ? runahead : 0;
+    } else {
+        *(uint32_t *)&ack[0] = preamble_len(tx_slots[1].rate);
+    }
+
+    mp_send_ack(ack, sizeof(ack), us_timestamp);
+}
+
+static void mp_client_reply_rx(int client);
 
 /* Returns 1 when the slot's transfer has finished. */
 static int process_tx(tx_slot *slot, int num)
 {
     slot->phase_time -= STEP_US;
-    if (slot->phase_time > 0)
-        return 0;
+    if (slot->phase_time > 0) {
+        if (slot->phase == 2) {
+            /* Deliver the clients' replies at their time slots. */
+            mp_reply_timer -= STEP_US;
+            if (mp_reply_timer <= 0 && mp_client_mask != 0) {
+                int nclient = 1;
+                uint16_t cur;
 
-    if (slot->phase == 0) {
-        /* preamble done */
+                while (!(mp_client_mask & (1 << nclient)))
+                    nclient++;
+                cur = 1 << nclient;
+                if (!(mp_client_fail & cur))
+                    mp_client_reply_rx(nclient);
+                mp_reply_timer += 10 + REG(W_CMD_REPLYTIME);
+                mp_client_mask &= ~cur;
+            }
+        }
+        return 0;
+    }
+
+    switch (slot->phase) {
+    case 0: /* preamble done */
         set_irq(7);
-        set_status(3);
+        set_status(num == 5 ? 8 : 3);
         slot->phase = 1;
         slot->phase_time = slot->length * (slot->rate == 2 ? 4 : 8);
         REG(W_RXTX_ADDR) = slot->addr >> 1;
-        tx_send_frame(slot, num);
+        if (num != 5)
+            tx_send_frame(slot, num);
+        return 0;
+
+    case 10: /* preamble done (default empty MP reply) */
+        set_irq(7);
+        set_status(8);
+        slot->phase = 11;
+        slot->phase_time = 28 * 4;
+        return 0;
+
+    case 1: /* transmit done */
+        if (num != 1 && num != 5)
+            RAM16(slot->addr) = 0x0001;
+        ram[slot->addr + 5] = 0;
+
+        if (num == 1) {
+            uint16_t res = 0;
+
+            if (REG(W_TXSTATCNT) & 0x4000) {
+                REG(W_TXSTAT) = 0x0800;
+                set_irq(1);
+            }
+            set_status(5);
+
+            mp_reply_timer = 16 + preamble_len(slot->rate);
+            if (mp_client_mask)
+                res = mp_recv_replies(mp_client_replies, us_timestamp, mp_client_mask);
+            mp_client_fail &= ~res;
+
+            slot->phase = 2;
+            slot->phase_time = 112 + (10 + REG(W_CMD_REPLYTIME)) * num_clients(mp_client_mask);
+            return 0;
+        }
+        if (num == 5) {
+            if (REG(W_TXSTATCNT) & 0x1000) {
+                REG(W_TXSTAT) = 0x0401;
+                set_irq(1);
+            }
+            set_status(1);
+            REG(W_TXBUSY) &= ~0x80;
+            fire_tx();
+            return 1;
+        }
+
+        REG(W_TXBUSY) &= ~(1 << num);
+        if (num == 4) {
+            if (REG(W_TXSTATCNT) & 0x8000) {
+                REG(W_TXSTAT) = 0x0301;
+                set_irq(1);
+            }
+        } else {
+            int loc = num ? num - 1 : 0;
+
+            REG(W_TXSTAT) = 0x0001 | (loc << 12);
+            set_irq(1);
+            REG(W_TXBUF_LOC1 + loc * 4) &= 0x7FFF;
+        }
+        set_status(1);
+        fire_tx();
+        return 1;
+
+    case 11: /* default empty MP reply finished */
+        REG(W_TX_SEQNO) = (REG(W_TX_SEQNO) + 1) & 0x0FFF;
+        REG(W_TXBUSY) &= ~0x80;
+        set_status(1);
+        fire_tx();
+        return 1;
+
+    case 2: { /* MP host: reply window done, send the ack */
+        uint16_t cmdcount = (cmd_counter + 9) / 10;
+
+        set_irq(7);
+        set_status(8);
+        REG(W_RXTX_ADDR) = 0xFC0;
+        slot->phase_time = 32 * (slot->rate == 2 ? 4 : 8);
+        report_mp_reply_errors(mp_client_fail);
+        send_mp_ack(cmdcount, mp_client_fail);
+        slot->phase = 3;
         return 0;
     }
 
-    /* transmit done */
-    RAM16(slot->addr) = 0x0001;
-    ram[slot->addr + 5] = 0;
-
-    REG(W_TXBUSY) &= ~(1 << num);
-
-    if (num == 4) {
-        if (REG(W_TXSTATCNT) & 0x8000) {
-            REG(W_TXSTAT) = 0x0301;
+    case 3: /* MP host: ack sent */
+        RAM16(slot->addr) = mp_client_fail ? 0x0005 : 0x0001;
+        RAM16(slot->addr + 2) = mp_client_fail;
+        if (!mp_client_fail)
+            increment_tx_count(slot);
+        REG(W_TX_SEQNO) = (REG(W_TX_SEQNO) + 1) & 0x0FFF;
+        if (REG(W_TXSTATCNT) & 0x2000) {
+            REG(W_TXSTAT) = 0x0B01;
             set_irq(1);
         }
-    } else {
-        int loc = num ? num - 1 : 0;
+        REG(W_TXBUSY) &= ~(1 << 1);
+        REG(W_TXBUF_CMD) &= 0x7FFF;
+        set_status(1);
+        set_irq(12);
+        fire_tx();
+        return 1;
 
-        REG(W_TXSTAT) = 0x0001 | (loc << 12);
-        set_irq(1);
-        REG(W_TXBUF_LOC1 + loc * 4) &= 0x7FFF;
+    case 13: /* MP transfer failed (no time left) */
+        REG(W_TXBUSY) &= ~(1 << 1);
+        REG(W_TXBUF_CMD) &= 0x7FFF;
+        RAM16(slot->addr) = 0x0005;
+        REG(W_TX_SEQNO) = (REG(W_TX_SEQNO) + 1) & 0x0FFF;
+        set_status(1);
+        set_irq(12);
+        fire_tx();
+        return 1;
     }
 
-    set_status(1);
-    fire_tx();
-    return 1;
+    return 0;
 }
 
 /* ---- receive ---- */
@@ -526,9 +858,10 @@ static int copy_rx_frame(void)
 
 static void finish_rx(void)
 {
-    uint16_t framectl, rxflags = 0x0010;
+    uint16_t framectl, seqno, rxflags = 0x0010;
     const uint8_t *dst;
     uint16_t headeraddr, addr;
+    int cmd_dupe = 0;
 
     com_status &= ~1;
     rx_counter = 0;
@@ -543,6 +876,7 @@ static void finish_rx(void)
     }
 
     framectl = *(uint16_t *)&rx_buffer[12];
+    seqno = *(uint16_t *)&rx_buffer[12 + 22];
 
     /* The hardware always checks the first address field. */
     dst = &rx_buffer[12 + 4];
@@ -592,16 +926,47 @@ static void finish_rx(void)
             return;
         if ((framectl & (1 << 11)) && !(rxfilter & 1))
             return;
-        rxflags |= 0x0008;
+
+        /* Multiplay frames are recognised by their fixed MAC addresses. */
+        if (mac_equal(&rx_buffer[12 + 16], mp_reply_mac)) {
+            rxflags |= (framectl & 0xF0) == 0x50 ? 0x000F : 0x000E;
+        } else if (mac_equal(&rx_buffer[12 + 4], mp_cmd_mac)) {
+            if (seqno == mp_last_seqno)
+                cmd_dupe = 1;
+            mp_last_seqno = seqno;
+            rxflags |= 0x000C;
+        } else if (mac_equal(&rx_buffer[12 + 4], mp_ack_mac)) {
+            rxflags |= 0x000D;
+        } else {
+            rxflags |= 0x0008;
+        }
 
         switch ((framectl >> 4) & 0xF) {
         case 0x0:
         case 0x4:
             break;
-        case 0x1: if (!(rxfilter & (1 << 1))) return; break;
-        case 0x2: if (!(rxfilter & (1 << 2))) return; break;
+        case 0x1:
+            if ((rxflags & 0xF) == 0xD) {
+                if (!(rxfilter & (1 << 7)))
+                    return;
+            } else if ((rxflags & 0xF) != 0xE) {
+                if (!(rxfilter & (1 << 1)))
+                    return;
+            }
+            break;
+        case 0x2:
+            if ((rxflags & 0xF) != 0xC && !(rxfilter & (1 << 2)))
+                return;
+            break;
         case 0x3: if (!(rxfilter & (1 << 3))) return; break;
-        case 0x5: if (!(rxfilter & (1 << 4))) return; break;
+        case 0x5:
+            if ((rxflags & 0xF) == 0xF) {
+                if (!(rxfilter & (1 << 8)))
+                    return;
+            } else if (!(rxfilter & (1 << 4))) {
+                return;
+            }
+            break;
         case 0x6: if (!(rxfilter & (1 << 5))) return; break;
         case 0x7: if (!(rxfilter & (1 << 6))) return; break;
         default: return;
@@ -612,33 +977,43 @@ static void finish_rx(void)
         return;
     }
 
-    if (!copy_rx_frame()) {
-        if (log_level >= 1)
-            log_line("wifi: RX buffer full, frame dropped");
-        return;
+    if (!cmd_dupe) {
+        if (!copy_rx_frame()) {
+            if (log_level >= 1)
+                log_line("wifi: RX buffer full, frame dropped");
+            return;
+        }
+
+        /* RX header */
+        headeraddr = REG(W_RXBUF_WRCSR) << 1;
+        RAM16(headeraddr) = rxflags;
+        increment_rx_addr(&headeraddr, 2);
+        RAM16(headeraddr) = 0x0040;
+        increment_rx_addr(&headeraddr, 4);
+        RAM16(headeraddr) = *(uint16_t *)&rx_buffer[6];   /* rate */
+        increment_rx_addr(&headeraddr, 2);
+        RAM16(headeraddr) = *(uint16_t *)&rx_buffer[8];   /* length */
+        increment_rx_addr(&headeraddr, 2);
+        RAM16(headeraddr) = 0x4080;                       /* RSSI */
+
+        addr = REG(W_RXTX_ADDR) << 1;
+        if (addr & 2)
+            increment_rx_addr(&addr, 2);
+        REG(W_RXBUF_WRCSR) = (addr & ~3) >> 1;
+
+        set_irq(0);
     }
 
-    /* RX header */
-    headeraddr = REG(W_RXBUF_WRCSR) << 1;
-    RAM16(headeraddr) = rxflags;
-    increment_rx_addr(&headeraddr, 2);
-    RAM16(headeraddr) = 0x0040;
-    increment_rx_addr(&headeraddr, 4);
-    RAM16(headeraddr) = *(uint16_t *)&rx_buffer[6];   /* rate */
-    increment_rx_addr(&headeraddr, 2);
-    RAM16(headeraddr) = *(uint16_t *)&rx_buffer[8];   /* length */
-    increment_rx_addr(&headeraddr, 2);
-    RAM16(headeraddr) = 0x4080;                       /* RSSI */
+    if ((rxflags & 0x800F) == 0x800C) {
+        /* Reply to the host's CMD frame. */
+        uint16_t clientmask = *(uint16_t *)&rx_buffer[0xC + 26];
 
-    addr = REG(W_RXTX_ADDR) << 1;
-    if (addr & 2)
-        increment_rx_addr(&addr, 2);
-    REG(W_RXBUF_WRCSR) = (addr & ~3) >> 1;
-
-    set_irq(0);
-
-    /* A beacon from our BSS syncs W_US_COUNT to its timestamp. */
-    if ((rxflags & 0x800F) == 0x8001) {
+        if (REG(W_AID_LOW) && (clientmask & (1 << REG(W_AID_LOW))))
+            send_mp_reply(*(uint16_t *)&rx_buffer[0xC + 24], clientmask);
+        else
+            mp_send_reply(NULL, 0, us_timestamp, 0);   /* blank, so the host need not time out */
+    } else if ((rxflags & 0x800F) == 0x8001) {
+        /* A beacon from our BSS syncs W_US_COUNT to its timestamp. */
         uint32_t len = *(uint16_t *)&rx_buffer[8] *
                        (*(uint16_t *)&rx_buffer[6] == 0x14 ? 4 : 8);
         uint64_t ts;
@@ -648,10 +1023,48 @@ static void finish_rx(void)
     }
 }
 
-static int check_rx(void)
+static void mp_client_reply_rx(int client)
+{
+    const uint8_t *reply = &mp_client_replies[(client - 1) * 1024];
+    int framelen;
+    uint8_t txrate;
+    uint16_t framectl;
+
+    if (REG(W_POWERSTATE) & (1 << 9))
+        return;
+    if (!(REG(W_RXCNT) & 0x8000))
+        return;
+    if (REG(W_RXBUF_BEGIN) == REG(W_RXBUF_END))
+        return;
+
+    framelen = *(const uint16_t *)&reply[10];
+    if (framelen > 1024 - 12)
+        framelen = 1024 - 12;
+    txrate = reply[8];
+    framectl = *(const uint16_t *)&reply[12];
+    if (framectl & (1 << 14))
+        framelen -= (REG(W_RXLEN_CROP) >> 7) & 0x1FE;
+    else
+        framelen -= (REG(W_RXLEN_CROP) << 1) & 0x1FE;
+    if (framelen < 0)
+        framelen = 0;
+
+    memcpy(rx_buffer, reply, 12 + framelen);
+    *(uint16_t *)&rx_buffer[6] = txrate;
+    *(uint16_t *)&rx_buffer[8] = framelen;
+
+    rx_timestamp = 0;
+    start_rx();
+}
+
+/* type: 0 = regular, 2 = frames from the MP host (blocking) */
+static int check_rx(int type)
 {
     int rxlen, framelen;
-    uint16_t framectl, crop;
+    uint16_t framectl, crop, frametype;
+    uint8_t txrate;
+    uint64_t timestamp;
+    int macgood;
 
     if (REG(W_POWERSTATE) & (1 << 9))
         return 0;
@@ -661,7 +1074,21 @@ static int check_rx(void)
         return 0;
 
     for (;;) {
-        rxlen = ap_recv(rx_buffer);
+        timestamp = 0;
+        if (type == 0) {
+            rxlen = mp_recv_packet(rx_buffer, &timestamp);
+            if (rxlen <= 0 && !is_mp)
+                rxlen = ap_recv(rx_buffer);
+        } else {
+            rxlen = mp_recv_host_packet(rx_buffer, &timestamp);
+            if (rxlen < 0) {
+                if (log_level >= 1)
+                    log_line("mp: host is gone");
+                is_mp = 0;
+                is_mp_client = 0;
+            }
+        }
+
         if (rxlen <= 0)
             return 0;
         if (rxlen < 12 + 24)
@@ -669,10 +1096,18 @@ static int check_rx(void)
         framelen = *(uint16_t *)&rx_buffer[10];
         if (framelen != rxlen - 12)
             continue;
+
+        /* Ignore multiplay frames when not in a multiplay session. */
+        if (type == 0 && !is_mp &&
+            (mac_equal(&rx_buffer[12 + 16], mp_reply_mac) ||
+             mac_equal(&rx_buffer[12 + 4], mp_cmd_mac) ||
+             mac_equal(&rx_buffer[12 + 4], mp_reply_mac)))
+            continue;
         break;
     }
 
     framectl = *(uint16_t *)&rx_buffer[12];
+    txrate = rx_buffer[8];
     crop = REG(W_RXLEN_CROP);
     if (framectl & (1 << 14)) {
         framelen -= (crop >> 7) & 0x1FE;
@@ -684,10 +1119,61 @@ static int check_rx(void)
     if (framelen < 0)
         framelen = 0;
 
-    *(uint16_t *)&rx_buffer[6] = rx_buffer[8];   /* rate */
+    *(uint16_t *)&rx_buffer[6] = txrate;
     *(uint16_t *)&rx_buffer[8] = framelen;
 
-    start_rx();
+    frametype = framectl & 0x00FF;
+    macgood = (rx_buffer[12 + 4] & 1) || mac_equal(&rx_buffer[12 + 4], wifi_mac());
+
+    /* During MP the host only stays awake for a short window after its beacon;
+     * give auth/assoc frames, which may arrive late here, some extra time. */
+    if ((frametype == 0x00B0 || frametype == 0x0010 || frametype == 0x0000) && timestamp &&
+        macgood && REG(W_POST_BEACON))
+        REG(W_POST_BEACON) += 10;
+
+    if (frametype == 0x0010 && timestamp && macgood) {
+        /* Association response from an MP host: sync to its clock. */
+        uint16_t aid = *(uint16_t *)&rx_buffer[12 + 24 + 4];
+
+        if (aid) {
+            if (log_level >= 1)
+                log_line("mp: joined host as client %u", aid & 0xF);
+            is_mp = 1;
+            is_mp_client = 1;
+            us_timestamp = timestamp;
+            next_sync = rx_timestamp + framelen * (txrate == 0x14 ? 4 : 8);
+        }
+        rx_timestamp = 0;
+        start_rx();
+    } else if (frametype == 0x00C0 && timestamp && macgood && is_mp_client) {
+        if (log_level >= 1)
+            log_line("mp: deauthenticated by host");
+        is_mp = 0;
+        is_mp_client = 0;
+        next_sync = 0;
+        rx_timestamp = 0;
+        start_rx();
+    } else if (macgood && is_mp_client) {
+        /* As a client, delay the frame until our clock reaches its timestamp,
+         * and work out how far we may run after it. */
+        rx_timestamp = timestamp;
+        if (rx_timestamp < us_timestamp)
+            rx_timestamp = us_timestamp;
+        next_sync = rx_timestamp + framelen * (txrate == 0x14 ? 4 : 8);
+
+        if (mac_equal(&rx_buffer[12 + 4], mp_cmd_mac)) {
+            uint16_t clienttime = *(uint16_t *)&rx_buffer[12 + 24];
+            uint16_t clientmask = *(uint16_t *)&rx_buffer[12 + 26];
+
+            next_sync += 112 + (clienttime + 10) * num_clients(clientmask);
+        } else if (mac_equal(&rx_buffer[12 + 4], mp_ack_mac)) {
+            next_sync += *(uint32_t *)&rx_buffer[0];
+        }
+    } else {
+        rx_timestamp = 0;
+        start_rx();
+    }
+
     return 1;
 }
 
@@ -715,12 +1201,35 @@ static void ms_timer(void)
     }
 }
 
+static int pick_tx_slot(uint16_t txbusy)
+{
+    if (txbusy & 0x0080) return 5;
+    if (txbusy & 0x0010) return 4;
+    if (txbusy & 0x0008) return 3;
+    if (txbusy & 0x0004) return 2;
+    if (txbusy & 0x0002) return 1;
+    if (txbusy & 0x0001) return 0;
+    return -1;
+}
+
 static void us_timer(void)
 {
     us_timestamp += STEP_US;
 
-    if (!(us_timestamp & 0x3FF & STEP_MASK))
+    if (is_mp_client && !com_status) {
+        if (rx_timestamp && us_timestamp >= rx_timestamp) {
+            rx_timestamp = 0;
+            start_rx();
+        }
+        /* Block until the host's next frame: this keeps the two consoles in sync. */
+        if (us_timestamp >= next_sync)
+            check_rx(2);
+    }
+
+    if (!(us_timestamp & 0x3FF & STEP_MASK)) {
         ap_ms_timer();
+        mp_poll();
+    }
 
     if (us_until_power_on < 0) {
         us_until_power_on += STEP_US;
@@ -761,35 +1270,27 @@ static void us_timer(void)
                 tx_cur = -1;
             } else {
                 com_status = 2;
-                if (txbusy & 0x0010) tx_cur = 4;
-                else if (txbusy & 0x0008) tx_cur = 3;
-                else if (txbusy & 0x0004) tx_cur = 2;
-                else tx_cur = 0;
+                tx_cur = pick_tx_slot(txbusy);
             }
         } else {
-            if (!(rx_counter & 0x1FF & STEP_MASK))
-                check_rx();
+            if (!is_mp_client || us_timestamp > next_sync) {
+                if (!(rx_counter & 0x1FF & STEP_MASK) && !com_status)
+                    check_rx(0);
+            }
             rx_counter += STEP_US;
         }
     }
 
     if ((com_status & 2) && tx_cur >= 0) {
         if (process_tx(&tx_slots[tx_cur], tx_cur)) {
-            uint16_t txbusy;
-
             if (REG(W_POWERSTATE) & (1 << 9)) {
                 REG(W_TXBUSY) = 0;
                 REG(W_TRX_POWER) = 0;
                 set_status(9);
             }
 
-            txbusy = REG(W_TXBUSY);
-            if (txbusy & 0x0010) tx_cur = 4;
-            else if (txbusy & 0x0008) tx_cur = 3;
-            else if (txbusy & 0x0004) tx_cur = 2;
-            else if (txbusy & 0x0001) tx_cur = 0;
-            else {
-                tx_cur = -1;
+            tx_cur = pick_tx_slot(REG(W_TXBUSY));
+            if (tx_cur < 0) {
                 com_status = 0;
                 rx_counter = 0;
             }
@@ -1011,6 +1512,13 @@ void wifi_write16(uint32_t off, uint16_t val)
 
     case W_POWER_US:
         REG(W_POWER_US) = val & 3;
+        if ((!(val & 1)) != power_on) {
+            power_on = !(val & 1);
+            if (power_on)
+                mp_begin();
+            else
+                mp_end();
+        }
         return;
 
     case W_POWER_TX:
@@ -1093,6 +1601,20 @@ void wifi_write16(uint32_t off, uint16_t val)
 
     case W_CMD_COUNT:
         cmd_counter = val * 10;
+        return;
+
+    case W_TXBUF_BEACON:
+        if (!!(val & 0x8000) != is_mp && log_level >= 1)
+            log_line("mp: %s beacons", (val & 0x8000) ? "hosting, sending" : "stopped sending");
+        is_mp = (val & 0x8000) != 0;
+        break;
+
+    case W_TXBUF_CMD:
+        /* Bit15 can only be set while W_CMD_COUNT is running. */
+        if (cmd_counter == 0)
+            val = (val & 0x7FFF) | (REG(W_TXBUF_CMD) & 0x8000);
+        REG(off) = val;
+        fire_tx();
         return;
 
     case W_BB_CNT:
